@@ -1,559 +1,793 @@
 #!/usr/bin/env bash
-set -e
-VERSION="1.0.0"
+set -Eeuo pipefail
+trap 'printf "\n  \033[31m●\033[0m Stopped at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-if [ -n "${OCB_PROJECTS_DIR:-}" ]; then
-  PROJECTS_ROOT="$OCB_PROJECTS_DIR"
-elif [ -d "/data/data/com.termux/files/home" ]; then
-  PROJECTS_ROOT="/data/data/com.termux/files/home/projects"
-else
-  PROJECTS_ROOT="$HOME/projects"
-fi
-mkdir -p "$PROJECTS_ROOT"
-[ -d "/root/.git" ] && rm -rf /root/.git /root/.bridge-handoff.md 2>/dev/null || true
+VERSION="2.0.0"
+B="\033[1m"; D="\033[2m"; G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; M="\033[35m"; Z="\033[0m"
+DOT="${M}●${Z}"
 
-case "${1:-}" in
-  -h|--help)
-    echo "ocb v$VERSION — Cross-Agent Handoff Bridge (OpenCode <-> Freebuff)"
-    echo "Usage: ocb | ocb --health | ocb --version | ocb --help"
-    exit 0 ;;
-  -v|--version)
-    echo "ocb v$VERSION"; exit 0 ;;
-  -b|--backup)
-    NEED_BACKUP=1 ;;
-  -r|--restore)
-    NEED_RESTORE=1 ;;
-esac
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ocb"
+AGENTS_CFG="$CFG_DIR/agents.json"
+PROJECTS_ROOT="$HOME/projects"
 
-CWD_REAL=$(pwd -P)
-TERMUX_HOME="/data/data/com.termux/files/home"
-if [ "$CWD_REAL" = "/root" ] || [ "$CWD_REAL" = "$HOME" ] || [ "$CWD_REAL" = "$TERMUX_HOME" ] || [ "$CWD_REAL" = "/sdcard" ] || [ "$CWD_REAL" = "/storage/emulated/0" ] || [ "$CWD_REAL" = "$PROJECTS_ROOT" ]; then
-  echo -e "\033[33m!\033[0m Run \033[1mocb\033[0m inside a project folder (e.g., \033[2mcd ~/projects/NewTermux\033[0m)."
-  exit 1
-fi
+cleanup_tty() { printf "\033[?25h" 2>/dev/null || true; }
+trap cleanup_tty EXIT INT TERM
 
-DB_PATH="${OPENCODE_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}/opencode.db"
-PROBE_TIMEOUT="${OCB_PROBE_TIMEOUT:-25}"
-get_project_fb_sid() {
-  python3 - "$1" << 'PY2' 2>/dev/null || true
-import sys, os, glob
-proj = sys.argv[1]
-base = os.path.expanduser("~/.config/manicode/projects")
-chats = [c for c in glob.glob(os.path.join(base, proj, "chats", "*")) if os.path.isdir(c)]
-if chats:
-    chats.sort(key=os.path.getmtime, reverse=True)
-    print(os.path.basename(chats[0]))
-PY2
+# --- Visual Progress Utilities ---
+draw_progress() {
+  local PCT="${1:-0}" LABEL="${2:-Working...}"
+  [ "$PCT" -lt 0 ] && PCT=0
+  [ "$PCT" -gt 100 ] && PCT=100
+  local WIDTH=20
+  local FILLED=$(( PCT * WIDTH / 100 ))
+  local EMPTY=$(( WIDTH - FILLED ))
+  local BAR_FILL="" BAR_EMP=""
+  local k=0
+  while [ "$k" -lt "$FILLED" ]; do BAR_FILL="${BAR_FILL}█"; k=$((k+1)); done
+  k=0
+  while [ "$k" -lt "$EMPTY" ]; do BAR_EMP="${BAR_EMP}░"; k=$((k+1)); done
+  printf "\r\033[K  ${C}[${G}%s${D}%s${C}]${Z} ${B}%3d%%${Z} ${D}· %s${Z}" "$BAR_FILL" "$BAR_EMP" "$PCT" "$LABEL"
+  if [ "$PCT" -eq 100 ]; then printf "\n"; fi
 }
 
-get_project_oc_sid() {
-  local PDIR="$1" PNAME="$2"
-  [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1 && sqlite3 -readonly "$DB_PATH" \
-    "SELECT id FROM session WHERE directory = '$PDIR' OR title LIKE '%$PNAME%' ORDER BY time_updated DESC LIMIT 1;" 2>/dev/null || true
-}
-
-slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c 1-32; }
-list_recent_opencode_sessions() {
-  [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1 && sqlite3 -readonly -separator '|' "$DB_PATH" \
-    "SELECT s.id, COALESCE(NULLIF(trim(s.title), ''), 'untitled'), datetime(s.time_updated/1000, 'unixepoch', 'localtime'), s.directory FROM session s WHERE EXISTS (SELECT 1 FROM message m JOIN part p ON p.message_id = m.id WHERE m.session_id = s.id AND json_extract(p.data, '$.type') = 'text' AND trim(json_extract(p.data, '$.text')) NOT IN ('Reply READY', 'READY')) ORDER BY s.time_updated DESC LIMIT 8;" 2>/dev/null
-}
-
-list_recent_freebuff_sessions() {
-  python3 - "$CWD_REAL" << 'PY2' 2>/dev/null || true
-import sys, os, glob, json, datetime
-
-cur_proj = os.path.basename(sys.argv[1]) if len(sys.argv) > 1 else ""
-base = os.path.expanduser("~/.config/manicode/projects")
-if not os.path.isdir(base): raise SystemExit(0)
-
-def extract_title(cd):
-    meta_f = os.path.join(cd, "chat-meta.json")
-    msg_f = os.path.join(cd, "chat-messages.json")
-    if os.path.isfile(meta_f):
-        try:
-            m = json.load(open(meta_f, errors="ignore"))
-            t = str(m.get("title") or m.get("name") or m.get("summary") or "").strip()
-            if t: return t[:38]
-        except Exception:
-            pass
-    if os.path.isfile(msg_f):
-        try:
-            data = json.load(open(msg_f, errors="ignore"))
-            items = data if isinstance(data, list) else (data.get("messages") or [])
-            for item in items:
-                if isinstance(item, dict) and item.get("role") == "user":
-                    c = item.get("content", "")
-                    if isinstance(c, list):
-                        c = " ".join(str(x.get("text", "")) for x in c if isinstance(x, dict))
-                    c = " ".join(str(c).split())
-                    if c and not c.startswith("/"):
-                        return c[:38]
-        except Exception:
-            pass
-    return ""
-
-found = []
-for cd in glob.glob(os.path.join(base, "*", "chats", "*")):
-    msg_f = os.path.join(cd, "chat-messages.json")
-    if not os.path.isfile(msg_f) or os.path.getsize(msg_f) < 10:
-        continue
-    sid = os.path.basename(cd)
-    proj = os.path.basename(os.path.dirname(os.path.dirname(cd)))
-    title = extract_title(cd) or f"Chat {sid[5:16]}"
-    is_cur = 1 if proj == cur_proj else 0
-    found.append((is_cur, os.path.getmtime(msg_f), sid, title, proj, cd))
-
-found.sort(key=lambda x: (x[0], x[1]), reverse=True)
-for _, mt, sid, title, proj, cd in found[:8]:
-    ts = datetime.datetime.fromtimestamp(mt).strftime("%m-%d %H:%M")
-    print(f"{sid}|{title}|{ts}|{cd}|{proj}")
-PY2
-}
-
-extract_opencode_context() {
-  local SID="$1" W="s.directory IN ('$CWD_PATH', '$CWD_REAL')"
-  [ -n "$SID" ] && W="m.session_id = '$SID'"
-  [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1 && sqlite3 -readonly "$DB_PATH" \
-    "SELECT '### ' || json_extract(m.data, '$.role') || char(10) || COALESCE(group_concat(json_extract(p.data, '$.text'), char(10)), '') FROM message m JOIN session s ON m.session_id = s.id LEFT JOIN part p ON p.message_id = m.id AND json_extract(p.data, '$.type') = 'text' WHERE $W GROUP BY m.id ORDER BY m.time_created DESC LIMIT 10;" 2>/dev/null || echo "(No OpenCode messages)"
-}
-
-extract_freebuff_context() {
-  python3 - "$1" << 'PY' 2>/dev/null || echo "(No Freebuff transcript)"
-import sys, json, os
-cd = sys.argv[1] if len(sys.argv) > 1 else ""
-msgs = []
-mf, lf = os.path.join(cd, "chat-messages.json"), os.path.join(cd, "log.jsonl")
-if os.path.isfile(mf):
-    try:
-        for m in json.load(open(mf, errors="ignore")):
-            if isinstance(m, dict):
-                c = m.get("content") or ""
-                if isinstance(c, list): c = "\n".join(str(x.get("text", x)) if isinstance(x, dict) else str(x) for x in c)
-                if str(c).strip(): msgs.append(f"### {m.get('role','msg')}\n{str(c).strip()[:1200]}")
-    except Exception: pass
-if not msgs and os.path.isfile(lf):
-    for ln in open(lf, errors="ignore"):
-        try:
-            o = json.loads(ln)
-            t = o.get("userPrompt") or o.get("prompt") or o.get("content") or o.get("text") or ""
-            if isinstance(t, list): t = "\n".join(str(x.get("text", x)) if isinstance(x, dict) else str(x) for x in t)
-            if str(t).strip(): msgs.append(f"### {o.get('role','event')}\n{str(t).strip()[:1200]}")
-        except Exception: pass
-print("\n\n".join(msgs[-4:]) if msgs else "(No messages extracted)")
-PY
-}
-
-select_tool_scope() {
-  local B="\033[1m" D="\033[2m" C="\033[36m" Z="\033[0m"
-  echo -e "  ${B}[1]${Z} Both ${D}(OpenCode + Freebuff)${Z}"
-  echo -e "  ${B}[2]${Z} OpenCode only"
-  echo -e "  ${B}[3]${Z} Freebuff only"
-  echo -e "  ${B}[4]${Z} Cancel"
-  printf "  ${C}›${Z} Target scope [1-4, Enter=1]: "; read -r SC; SC="${SC:-1}"
-  case "$SC" in
-    1) TOOL_SCOPE="both" ;;
-    2) TOOL_SCOPE="opencode" ;;
-    3) TOOL_SCOPE="freebuff" ;;
-    *) return 1 ;;
-  esac
-  return 0
-}
-
-collect_bin_paths() {
-  local BIN="$1" BP RP PKG_DIR
-  BP=$(command -v "$BIN" 2>/dev/null || true)
-  if [ -n "$BP" ] && [ -e "$BP" ]; then
-    echo "${BP#/}"
-    RP=$(readlink -f "$BP" 2>/dev/null || true)
-    if [ -n "$RP" ] && [ -e "$RP" ]; then
-      PKG_DIR=$(echo "$RP" | sed -E "s|(/node_modules/[^/]+).*|\1|")
-      [ -d "$PKG_DIR" ] && echo "${PKG_DIR#/}" || echo "${RP#/}"
-    fi
-  fi
-}
-
-run_tool_backup() {
-  local B="\033[1m" D="\033[2m" G="\033[32m" Y="\033[33m" R="\033[31m" C="\033[36m" Z="\033[0m"
-  command -v zstd >/dev/null 2>&1 || { echo -e "  ${R}●${Z} zstd not installed (run: apt install -y zstd)"; return 1; }
-
-  local DL_ROOT=""
-  for CAND in "/sdcard/Download" "/storage/emulated/0/Download" "/data/data/com.termux/files/home/storage/downloads"; do
-    if [ -d "$CAND" ] && [ -w "$CAND" ]; then DL_ROOT="$CAND"; break; fi
+run_with_spinner() {
+  local LABEL="$1"; shift
+  local FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local TMP_OUT; TMP_OUT=$(mktemp)
+  "$@" >"$TMP_OUT" 2>&1 &
+  local PID=$!
+  local IDX=0 TICKS=0
+  printf "\033[?25l" 2>/dev/null || true
+  while kill -0 "$PID" 2>/dev/null; do
+    local SEC=$(( TICKS / 10 )).$(( TICKS % 10 ))
+    printf "\r\033[K  ${C}%s${Z} ${D}%s (${SEC}s)${Z}" "${FRAMES[$IDX]}" "$LABEL"
+    IDX=$(( (IDX + 1) % ${#FRAMES[@]} ))
+    TICKS=$(( TICKS + 1 ))
+    sleep 0.1
   done
-  [ -z "$DL_ROOT" ] && { echo -e "  ${R}●${Z} Shared Download folder not accessible (run termux-setup-storage)."; return 1; }
-
-  echo -e "\n  ${B}tool backup${Z} ${D}· zstd archive${Z}\n  ${D}------------------------------------------${Z}"
-  TOOL_SCOPE=""
-  select_tool_scope || { echo -e "  ${D}Backup cancelled.${Z}\n"; return 0; }
-
-  local ITEMS=()
-  if [ "$TOOL_SCOPE" = "both" ] || [ "$TOOL_SCOPE" = "opencode" ]; then
-    for P in "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.opencode"; do
-      [ -e "$P" ] && ITEMS+=("${P#/}")
-    done
-    while IFS= read -r BP; do [ -n "$BP" ] && ITEMS+=("$BP"); done < <(collect_bin_paths opencode)
+  set +e; wait "$PID"; local RC=$?; set -e
+  printf "\r\033[K\033[?25h" 2>/dev/null || true
+  while IFS= read -r -t 0.01 -n 1 _ </dev/tty 2>/dev/null; do :; done
+  SPINNER_OUT=$(cat "$TMP_OUT")
+  rm -f "$TMP_OUT"
+  if [ "$RC" -ne 0 ] && [ -n "$SPINNER_OUT" ]; then
+    echo -e "  ${R}●${Z} $SPINNER_OUT" >&2
   fi
-
-  if [ "$TOOL_SCOPE" = "both" ] || [ "$TOOL_SCOPE" = "freebuff" ]; then
-    for P in "$HOME/.config/manicode"; do
-      [ -e "$P" ] && ITEMS+=("${P#/}")
-    done
-    while IFS= read -r BP; do [ -n "$BP" ] && ITEMS+=("$BP"); done < <(collect_bin_paths freebuff)
-  fi
-
-  [ "$TOOL_SCOPE" = "both" ] && [ -e "/usr/local/bin/oc-auto" ] && ITEMS+=("usr/local/bin/oc-auto")
-
-  mapfile -t UNIQ_ITEMS < <(printf "%s\n" "${ITEMS[@]}" | awk '!seen[$0]++')
-  if [ ${#UNIQ_ITEMS[@]} -eq 0 ]; then
-    echo -e "  ${Y}●${Z} No ${TOOL_SCOPE} files found to back up.\n"
-    return 1
-  fi
-
-  local DEST_DIR="$DL_ROOT/TOOL BACKUP"
-  mkdir -p "$DEST_DIR"
-  local OUT_FILE="$DEST_DIR/ocb-${TOOL_SCOPE}-$(date +%Y%m%d-%H%M%S).tzst"
-
-  echo -e "  ${C}●${Z} Archiving ${B}${TOOL_SCOPE}${Z} (${#UNIQ_ITEMS[@]} path(s))..."
-  tar -C / --ignore-failed-read -cf - "${UNIQ_ITEMS[@]}" 2>/dev/null | zstd -T0 -9 -q -o "$OUT_FILE"
-  local SZ=$(du -h "$OUT_FILE" | cut -f1)
-  echo -e "  ${G}✓${Z} Saved: ${B}Download/TOOL BACKUP/$(basename "$OUT_FILE")${Z} ${D}($SZ)${Z}\n"
+  return "$RC"
 }
 
 back_to_menu_loader() {
-  local D="\033[2m" C="\033[36m" Z="\033[0m"
-  for F in "|" "/" "-" "\\"; do
-    printf "\r  ${C}%s${Z} ${D}Returning to main menu...${Z}" "$F"
-    sleep 0.18
+  local FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴")
+  for F in "${FRAMES[@]}"; do
+    printf "\r\033[K  ${C}%s${Z} ${D}Returning to main menu...${Z}" "$F"
+    sleep 0.12
   done
   printf "\r\033[K\n"
 }
 
-run_tool_restore() {
-  local B="\033[1m" D="\033[2m" G="\033[32m" Y="\033[33m" R="\033[31m" C="\033[36m" Z="\033[0m"
-  command -v zstd >/dev/null 2>&1 || { echo -e "  ${R}●${Z} zstd not installed (run: apt install -y zstd)"; return 1; }
-
-  local DL_ROOT=""
-  for CAND in "/sdcard/Download" "/storage/emulated/0/Download" "/data/data/com.termux/files/home/storage/downloads"; do
-    if [ -d "$CAND" ]; then DL_ROOT="$CAND"; break; fi
+read_choice() {
+  local PROMPT="$1" MIN="$2" MAX="$3" VAL=""
+  while true; do
+    printf "%b" "$PROMPT" >/dev/tty
+    IFS= read -r VAL </dev/tty || exit 130
+    VAL="${VAL//[[:space:]]/}"
+    if [ -z "$VAL" ]; then
+      printf "  \033[33m●\033[0m Empty input — enter %s-%s (or q to cancel).\n" "$MIN" "$MAX" >/dev/tty
+      continue
+    fi
+    case "$VAL" in q|Q) echo "CANCEL"; return 0 ;; esac
+    if [[ "$VAL" =~ ^[0-9]+$ ]] && [ "$VAL" -ge "$MIN" ] && [ "$VAL" -le "$MAX" ]; then
+      echo "$VAL"; return 0
+    fi
+    printf "  \033[33m●\033[0m Invalid — enter %s-%s (or q to cancel).\n" "$MIN" "$MAX" >/dev/tty
   done
+}
+
+# --- Default Multi-Agent Registry ---
+ensure_agents_config() {
+  mkdir -p "$CFG_DIR"
+  if [ ! -f "$AGENTS_CFG" ]; then
+    cat << 'JSON' > "$AGENTS_CFG"
+{
+  "opencode": {
+    "label": "OpenCode",
+    "bin": "opencode",
+    "parser": "sqlite_opencode",
+    "db": "~/.local/share/opencode/opencode.db",
+    "resume_cmd": "opencode -s {session_id}",
+    "new_cmd": "opencode",
+    "backup_paths": ["~/.config/opencode", "~/.local/share/opencode", "~/.opencode"]
+  },
+  "freebuff": {
+    "label": "Freebuff",
+    "bin": "freebuff",
+    "parser": "manicode_json",
+    "sessions_dir": "~/.config/manicode/projects",
+    "resume_cmd": "freebuff --continue {session_id}",
+    "new_cmd": "freebuff",
+    "backup_paths": ["~/.config/manicode"]
+  },
+  "claude": {
+    "label": "Claude Code",
+    "bin": "claude",
+    "parser": "claude_jsonl",
+    "sessions_dir": "~/.claude/projects",
+    "resume_cmd": "claude --resume {session_id}",
+    "new_cmd": "claude",
+    "backup_paths": ["~/.claude", "~/.claude.json"]
+  },
+  "aider": {
+    "label": "Aider",
+    "bin": "aider",
+    "parser": "markdown_file",
+    "history_file": ".aider.chat.history.md",
+    "resume_cmd": "aider --restore-chat-history",
+    "new_cmd": "aider",
+    "backup_paths": ["~/.aider.conf.yml", "~/.aider.model.settings.yml"]
+  },
+  "gemini": {
+    "label": "Gemini CLI",
+    "bin": "gemini",
+    "parser": "git_diff",
+    "resume_cmd": "gemini",
+    "new_cmd": "gemini",
+    "backup_paths": ["~/.gemini"]
+  },
+  "codex": {
+    "label": "Codex CLI",
+    "bin": "codex",
+    "parser": "git_diff",
+    "resume_cmd": "codex",
+    "new_cmd": "codex",
+    "backup_paths": ["~/.codex"]
+  }
+}
+JSON
+  fi
+}
+
+detect_installed_agents() {
+  ensure_agents_config
+  python3 - "$AGENTS_CFG" << 'PY'
+import json, shutil, sys
+cfg = json.load(open(sys.argv[1]))
+for key, meta in cfg.items():
+    b = meta.get("bin", key)
+    path = shutil.which(b)
+    if path:
+        lbl = meta.get("label", key); prs = meta.get("parser", "git_diff"); print(f"{key}|{lbl}|{path}|{prs}")
+PY
+}
+
+# --- Session Discovery Across Adapters ---
+list_agent_sessions() {
+  local AGENT_KEY="$1"
+  ensure_agents_config
+  python3 - "$AGENTS_CFG" "$AGENT_KEY" "$PWD" << 'PY'
+import json, os, sys, glob, sqlite3, datetime
+
+cfg = json.load(open(sys.argv[1]))
+key = sys.argv[2]
+cwd = os.path.realpath(sys.argv[3])
+meta = cfg.get(key, {})
+parser = meta.get("parser", "git_diff")
+
+def fmt_ts(ts):
+    try:
+        if ts > 1e12: ts /= 1000.0
+        return datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+    except Exception:
+        return "recent"
+
+if parser == "sqlite_opencode":
+    db = os.path.expanduser(meta.get("db", "~/.local/share/opencode/opencode.db"))
+    if os.path.isfile(db):
+        con = sqlite3.connect(db)
+        cur = con.cursor()
+        # Clean probe-only sessions automatically
+        try:
+            cur.execute("""
+                DELETE FROM session WHERE id IN (
+                  SELECT m.session_id FROM message m JOIN part p ON p.message_id = m.id
+                  WHERE json_extract(p.data, '$.type') = 'text'
+                    AND trim(json_extract(p.data, '$.text')) IN ('Reply READY', 'READY')
+                )
+            """)
+            con.commit()
+        except Exception:
+            pass
+        rows = cur.execute("""
+            SELECT s.id, COALESCE(NULLIF(trim(s.title), ''), s.id), COALESCE(s.directory, ''), COALESCE(s.time_updated, s.time_created, 0)
+            FROM session s
+            WHERE EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
+            ORDER BY COALESCE(s.time_updated, s.time_created, 0) DESC LIMIT 12
+        """).fetchall()
+        for sid, title, sdir, ts in rows:
+            proj = os.path.basename(sdir.rstrip("/")) or "workspace"
+            print(f"{sid}|{title[:42]}|{proj}|{fmt_ts(ts)}")
+
+elif parser == "manicode_json":
+    root = os.path.expanduser(meta.get("sessions_dir", "~/.config/manicode/projects"))
+    found = []
+    for cf in glob.glob(os.path.join(root, "*", "chats", "*", "chat-messages.json")):
+        try:
+            data = json.load(open(cf))
+            if not data: continue
+            cdir = os.path.dirname(cf)
+            cid = os.path.basename(cdir)
+            proj = os.path.basename(os.path.dirname(os.path.dirname(cdir)))
+            mt = os.path.getmtime(cf)
+            title = f"Chat {cid[:14]}"
+            for msg in data:
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    txt = str(msg.get("content", "")).strip().splitlines()[0]
+                    if txt and not txt.startswith("Read .bridge-handoff.md"):
+                        title = txt[:42]; break
+            found.append((mt, cid, title, proj))
+        except Exception:
+            pass
+    for mt, cid, title, proj in sorted(found, reverse=True)[:12]:
+        print(f"{cid}|{title}|{proj}|{fmt_ts(mt)}")
+
+elif parser == "claude_jsonl":
+    root = os.path.expanduser(meta.get("sessions_dir", "~/.claude/projects"))
+    found = []
+    for jf in glob.glob(os.path.join(root, "*", "*.jsonl")):
+        try:
+            if os.path.getsize(jf) < 50: continue
+            sid = os.path.splitext(os.path.basename(jf))[0]
+            proj = os.path.basename(os.path.dirname(jf))[-20:]
+            mt = os.path.getmtime(jf)
+            title = f"Session {sid[:12]}"
+            for line in open(jf):
+                obj = json.loads(line)
+                if obj.get("type") == "user":
+                    msg = obj.get("message", {})
+                    c = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                    if isinstance(c, list):
+                        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    c = str(c).strip().splitlines()[0]
+                    if c: title = c[:42]; break
+            found.append((mt, sid, title, proj))
+        except Exception:
+            pass
+    for mt, sid, title, proj in sorted(found, reverse=True)[:12]:
+        print(f"{sid}|{title}|{proj}|{fmt_ts(mt)}")
+
+elif parser == "markdown_file":
+    hf = os.path.join(cwd, meta.get("history_file", ".aider.chat.history.md"))
+    if os.path.isfile(hf) and os.path.getsize(hf) > 0:
+        print(f"aider-local|Aider Chat History|{os.path.basename(cwd)}|{fmt_ts(os.path.getmtime(hf))}")
+
+print(f"git-diff|Current Git Diff & Recent Commits|{os.path.basename(cwd)}|live")
+PY
+}
+
+# --- Build .bridge-handoff.md with Linear Progress Bar ---
+build_handoff_package() {
+  local SRC_AGENT="$1" SRC_SID="$2" TGT_AGENT="$3"
+  local OUT_MD="$PWD/.bridge-handoff.md"
+  echo ""
+  draw_progress 15 "Securing .git/info/exclude..."
+  if [ -d "$PWD/.git" ]; then
+    {
+      mkdir -p "$PWD/.git/info"
+      grep -qxF ".bridge-handoff.md" "$PWD/.git/info/exclude" 2>/dev/null || echo ".bridge-handoff.md" >> "$PWD/.git/info/exclude"
+      git tag -f opencode-latest >/dev/null 2>&1
+    } 2>/dev/null || true
+  fi
+  sleep 0.08
+
+  draw_progress 45 "Extracting ${SRC_AGENT} session context..."
+  local CONTEXT_BODY
+  CONTEXT_BODY=$(python3 - "$AGENTS_CFG" "$SRC_AGENT" "$SRC_SID" "$PWD" << 'PY'
+import json, os, sys, glob, sqlite3
+cfg = json.load(open(sys.argv[1]))
+key, sid, cwd = sys.argv[2], sys.argv[3], sys.argv[4]
+meta = cfg.get(key, {})
+parser = meta.get("parser", "git_diff")
+out = []
+try:
+    if sid != "git-diff":
+        if parser == "sqlite_opencode":
+            db = os.path.expanduser(meta.get("db", "~/.local/share/opencode/opencode.db"))
+            if os.path.isfile(db):
+                con = sqlite3.connect(db)
+                q = """SELECT json_extract(m.data, '$.role'), json_extract(p.data, '$.type'),
+                              json_extract(p.data, '$.text'), json_extract(p.data, '$.tool'),
+                              json_extract(p.data, '$.state.input')
+                       FROM message m JOIN part p ON p.message_id = m.id
+                       WHERE m.session_id = ? ORDER BY m.rowid ASC, p.rowid ASC"""
+                touched = []
+                for role, ptype, body, tool, tinput in con.execute(q, (sid,)).fetchall()[-40:]:
+                    if ptype == "text" and body:
+                        out.append("### " + str(role or "msg").upper() + "\n" + str(body).strip()[:1800])
+                    elif tool:
+                        inp = str(tinput or "")[:220]
+                        touched.append(f"- `{tool}`: {inp}")
+                if touched:
+                    out.append("### OPENCODE TOOL & FILE ACTIONS (RECENT)\n" + "\n".join(touched[-20:]))
+        elif parser == "manicode_json":
+            root = os.path.expanduser(meta.get("sessions_dir", "~/.config/manicode/projects"))
+            m = glob.glob(os.path.join(root, "*", "chats", sid, "chat-messages.json"))
+            if m:
+                raw = json.load(open(m[0]))
+                msgs = raw if isinstance(raw, list) else raw.get("messages", [])
+                for msg in msgs[-16:]:
+                    if isinstance(msg, dict) and msg.get("content"):
+                        out.append("### " + str(msg.get("role", "msg")).upper() + "\n" + str(msg["content"]).strip()[:1500])
+        elif parser == "claude_jsonl":
+            root = os.path.expanduser(meta.get("sessions_dir", "~/.claude/projects"))
+            m = glob.glob(os.path.join(root, "*", f"{sid}.jsonl"))
+            if m:
+                for line in open(m[0]).readlines()[-20:]:
+                    obj = json.loads(line)
+                    if obj.get("type") in ("user", "assistant"):
+                        msg = obj.get("message", {})
+                        c = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                        if isinstance(c, list):
+                            c = "\n".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("text"))
+                        if c:
+                            out.append("### " + str(obj["type"]).upper() + "\n" + str(c).strip()[:1500])
+        elif parser == "markdown_file":
+            hf = os.path.join(cwd, meta.get("history_file", ".aider.chat.history.md"))
+            if os.path.isfile(hf):
+                out.append(open(hf).read()[-8000:])
+except Exception as ex:
+    out.append(f"_Transcript fallback ({ex}); relying on live Git state below._")
+print("\n\n".join(out) if out else "_No prior transcript parsed; relying on live Git state below._")
+PY
+)
+
+  draw_progress 75 "Capturing Git status, commits & working diff..."
+  local GIT_STATUS="" GIT_LOG="" GIT_DIFF=""
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_STATUS=$(git status -sb 2>/dev/null || true)
+    GIT_LOG=$(git log -n 5 --oneline 2>/dev/null || true)
+    GIT_DIFF=$(git diff HEAD 2>/dev/null | head -c 14000 || true)
+  fi
+  sleep 0.08
+
+  draw_progress 100 "Writing .bridge-handoff.md for ${TGT_AGENT}..."
+  cat << MD > "$OUT_MD"
+# Cross-Agent Handoff (${SRC_AGENT} -> ${TGT_AGENT})
+- **Workspace:** \`$PWD\`
+- **Source Session:** \`$SRC_SID\`
+- **Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")
+
+## Mandatory Agent Rules\n- Read this entire file and inspect `git status` + `git diff` BEFORE modifying any file.\n- Do NOT rewrite or revert existing uncommitted changes unless fixing an explicit bug.\n- Keep changes minimal, surgical, and aligned with the project's existing architecture.\n\n## Recent Conversation Context
+$CONTEXT_BODY
+
+## Git Repository State
+\`\`\`text
+$GIT_STATUS
+\`\`\`
+
+### Recent Commits
+\`\`\`text
+$GIT_LOG
+\`\`\`
+
+### Working Diff
+\`\`\`diff
+$GIT_DIFF
+\`\`\`
+MD
+}
+
+launch_target_agent() {
+  local TGT_AGENT="$1" TGT_SID="${2:-}"
+  local LAUNCH_CMD
+  LAUNCH_CMD=$(python3 - "$AGENTS_CFG" "$TGT_AGENT" "$TGT_SID" << 'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+meta = cfg.get(sys.argv[2], {})
+sid = sys.argv[3]
+if sid and sid != "new" and "{session_id}" in meta.get("resume_cmd", ""):
+    print(meta["resume_cmd"].format(session_id=sid))
+else:
+    print(meta.get("new_cmd", meta.get("bin", sys.argv[2])))
+PY
+)
+  echo -e "\n  ${G}✓${Z} Handoff ready in ${B}.bridge-handoff.md${Z}"
+  echo -e "  ${C}›${Z} Tell ${B}${TGT_AGENT}${Z}: ${D}\"Read .bridge-handoff.md and continue\"${Z}"
+  echo -e "  ${C}●${Z} Launching: ${B}${LAUNCH_CMD}${Z}\n"
+  eval "exec $LAUNCH_CMD"
+}
+
+# --- Git Health Audit ---
+run_git_health() {
+  echo -e "\n  ${B}git health${Z} ${D}· $PWD${Z}\n  ${D}------------------------------------------${Z}"
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo -e "  ${Y}●${Z} Not inside a Git repository.\n"
+    return 0
+  fi
+  run_with_spinner "Auditing index, locks & objects..." git fsck --no-dangling || true
+  local LOCKS; LOCKS=$(find .git -name "*.lock" 2>/dev/null || true)
+  if [ -n "$LOCKS" ]; then
+    echo -e "  ${Y}●${Z} Stale lock files found:\n$LOCKS"
+    printf "  ${C}›${Z} Remove stale lock files? [y/N]: "; read -r RL
+    [[ "$RL" =~ ^[yY] ]] && find .git -name "*.lock" -delete && echo -e "  ${G}✓${Z} Locks cleared."
+  else
+    echo -e "  ${G}✓${Z} No stale .lock files"
+  fi
+  echo -e "  ${G}✓${Z} Branch: ${B}$(git branch --show-current 2>/dev/null || echo detached)${Z}"
+  echo -e "  ${G}✓${Z} Status: $(git status -s | wc -l | tr -d " ") modified file(s)\n"
+}
+
+# --- Selective Multi-Agent Backup & Restore with Progress Bar ---
+find_download_dir() {
+  for CAND in "/sdcard/Download" "/storage/emulated/0/Download" "/data/data/com.termux/files/home/storage/downloads" "$HOME/Downloads"; do
+    if [ -d "$CAND" ] && [ -w "$CAND" ]; then echo "$CAND"; return 0; fi
+  done
+  return 1
+}
+
+run_tool_backup() {
+  local PRE_SCOPE="${1:-}"
+  command -v zstd >/dev/null 2>&1 || { echo -e "  ${R}●${Z} zstd not installed (apt install -y zstd)"; return 1; }
+  local DL_ROOT; DL_ROOT=$(find_download_dir) || { echo -e "  ${R}●${Z} Download folder not accessible."; return 1; }
+
+  mapfile -t INSTALLED < <(detect_installed_agents)
+  if [ ${#INSTALLED[@]} -eq 0 ]; then
+    echo -e "  ${Y}●${Z} No supported agents detected on PATH.\n"; return 1
+  fi
+
+  local SCOPE="$PRE_SCOPE"
+  if [ -z "$SCOPE" ]; then
+    echo -e "\n  ${B}tool backup${Z} ${D}· selective zstd archive${Z}\n  ${D}------------------------------------------${Z}"
+    echo -e "  ${B}[1]${Z} All detected tools ${D}(${#INSTALLED[@]} agent(s))${Z}"
+    local I=2
+    for ROW in "${INSTALLED[@]}"; do
+      IFS="|" read -r K L P _ <<< "$ROW"
+      echo -e "  ${B}[$I]${Z} $L ${D}($K)${Z}"
+      I=$((I+1))
+    done
+    echo -e "  ${B}[$I]${Z} Cancel"
+    SC=$(read_choice "  ${C}›${Z} Target scope [1-${I}]: " 1 "$I")
+    [ "$SC" = "CANCEL" ] && return 0
+    if [ "$SC" = "$I" ] || [ "$SC" = "q" ]; then echo -e "  ${D}Backup cancelled.${Z}\n"; return 0; fi
+    if [ "$SC" = "1" ]; then SCOPE="all"
+    else
+      local IDX=$((SC-2))
+      [ "$IDX" -ge 0 ] && [ "$IDX" -lt ${#INSTALLED[@]} ] || return 0
+      SCOPE="${INSTALLED[$IDX]%%|*}"
+    fi
+  fi
+
+  mapfile -t PATHS < <(python3 - "$AGENTS_CFG" "$SCOPE" << 'PY'
+import json, os, shutil, sys
+cfg = json.load(open(sys.argv[1]))
+scope = sys.argv[2]
+keys = list(cfg.keys()) if scope == "all" else [scope]
+seen = set()
+for k in keys:
+    meta = cfg.get(k, {})
+    b = shutil.which(meta.get("bin", k))
+    if not b and scope == "all": continue
+    for raw in meta.get("backup_paths", []):
+        p = os.path.expanduser(raw)
+        if os.path.exists(p) and p not in seen:
+            seen.add(p); print(p.lstrip("/"))
+    if b and os.path.exists(b):
+        if b not in seen: seen.add(b); print(b.lstrip("/"))
+        rp = os.path.realpath(b)
+        if os.path.exists(rp) and rp not in seen:
+            seen.add(rp); print(rp.lstrip("/"))
+if scope == "all" and os.path.exists("/usr/local/bin/oc-auto"):
+    print("usr/local/bin/oc-auto")
+PY
+)
+
+  if [ ${#PATHS[@]} -eq 0 ]; then
+    echo -e "  ${Y}●${Z} No files found for ${SCOPE}.\n"; return 1
+  fi
+
   local DEST_DIR="$DL_ROOT/TOOL BACKUP"
-  if [ -z "$DL_ROOT" ] || [ ! -d "$DEST_DIR" ]; then
+  mkdir -p "$DEST_DIR"
+  local OUT_FILE="$DEST_DIR/ocb-${SCOPE}-$(date +%Y%m%d-%H%M%S).tzst"
+
+  echo ""
+  draw_progress 10 "Calculating archive size (${#PATHS[@]} target(s))..."
+  local TOTAL_BYTES=0
+  for P in "${PATHS[@]}"; do
+    local SZ; SZ=$(du -sb "/$P" 2>/dev/null | cut -f1 || echo 0)
+    TOTAL_BYTES=$(( TOTAL_BYTES + SZ ))
+  done
+  [ "$TOTAL_BYTES" -le 0 ] && TOTAL_BYTES=1048576
+
+  tar -C / --ignore-failed-read -cf - "${PATHS[@]}" 2>/dev/null | zstd -T0 -9 -q -o "$OUT_FILE" &
+  local TPID=$!
+  while kill -0 "$TPID" 2>/dev/null; do
+    local CUR_SZ; CUR_SZ=$(stat -c%s "$OUT_FILE" 2>/dev/null || echo 0)
+    # Estimate compressed ratio (~35% of raw) so bar progresses smoothly 15%..95%
+    local EST_PCT=$(( 15 + (CUR_SZ * 220 / TOTAL_BYTES) ))
+    [ "$EST_PCT" -gt 95 ] && EST_PCT=95
+    draw_progress "$EST_PCT" "Compressing ${SCOPE} (.tzst)..."
+    sleep 0.15
+  done
+  wait "$TPID"
+  draw_progress 100 "Saved Download/TOOL BACKUP/$(basename "$OUT_FILE") ($(du -h "$OUT_FILE" | cut -f1))"
+  echo ""
+}
+
+run_tool_restore() {
+  local CLI_MODE="${1:-0}"
+  command -v zstd >/dev/null 2>&1 || { echo -e "  ${R}●${Z} zstd not installed (apt install -y zstd)"; return 1; }
+  local DL_ROOT; DL_ROOT=$(find_download_dir) || { echo -e "  ${R}●${Z} Download folder not accessible."; return 1; }
+  local DEST_DIR="$DL_ROOT/TOOL BACKUP"
+
+  if [ ! -d "$DEST_DIR" ]; then
     echo -e "\n  ${Y}●${Z} No TOOL BACKUP folder found in Download."
-    [ "${NEED_RESTORE:-0}" -eq 1 ] && return 1
+    [ "$CLI_MODE" -eq 1 ] && return 1
     back_to_menu_loader; return 0
   fi
 
   mapfile -t ARCHIVES < <(ls -1t "$DEST_DIR"/*.tzst 2>/dev/null || true)
   if [ ${#ARCHIVES[@]} -eq 0 ]; then
     echo -e "\n  ${Y}●${Z} No .tzst backups found in Download/TOOL BACKUP."
-    [ "${NEED_RESTORE:-0}" -eq 1 ] && return 1
+    [ "$CLI_MODE" -eq 1 ] && return 1
     back_to_menu_loader; return 0
   fi
 
   echo -e "\n  ${B}tool restore${Z} ${D}· Download/TOOL BACKUP${Z}\n  ${D}------------------------------------------${Z}"
   local I=1
   for A in "${ARCHIVES[@]}"; do
-    local SZ=$(du -h "$A" | cut -f1)
-    echo -e "  ${B}[$I]${Z} $(basename "$A") ${D}· $SZ${Z}"
+    echo -e "  ${B}[$I]${Z} $(basename "$A") ${D}· $(du -h "$A" | cut -f1)${Z}"
     I=$((I+1))
   done
   echo -e "  ${B}[$I]${Z} Cancel"
-  printf "  ${C}›${Z} Select backup [1-%d, Enter=1]: " "$I"; read -r RC; RC="${RC:-1}"
+  RC=$(read_choice "  ${C}›${Z} Select backup [1-${I}]: " 1 "$I")
+  [ "$RC" = "CANCEL" ] && return 0
   if [ "$RC" = "$I" ] || [ "$RC" = "q" ] || [ "$RC" -lt 1 ] 2>/dev/null || [ "$RC" -gt "$I" ] 2>/dev/null; then
     echo -e "  ${D}Restore cancelled.${Z}\n"; return 0
   fi
 
   local PICK="${ARCHIVES[$((RC-1))]}"
+  mapfile -t INSTALLED < <(detect_installed_agents)
   echo -e "\n  ${D}Which tool(s) should be restored from $(basename "$PICK")?${Z}"
-  TOOL_SCOPE=""
-  select_tool_scope || { echo -e "  ${D}Restore cancelled.${Z}\n"; return 0; }
+  echo -e "  ${B}[1]${Z} Everything in archive"
+  local J=2
+  for ROW in "${INSTALLED[@]}"; do
+    IFS="|" read -r K L _ _ <<< "$ROW"
+    echo -e "  ${B}[$J]${Z} $L only ${D}($K)${Z}"
+    J=$((J+1))
+  done
+  echo -e "  ${B}[$J]${Z} Cancel"
+  RS=$(read_choice "  ${C}›${Z} Restore scope [1-${J}]: " 1 "$J")
+  [ "$RS" = "CANCEL" ] && return 0
+  if [ "$RS" = "$J" ] || [ "$RS" = "q" ]; then echo -e "  ${D}Restore cancelled.${Z}\n"; return 0; fi
 
-  local LIST_TMP=$(mktemp)
-  zstd -dc "$PICK" | tar -tf - | python3 -c '
+  local SCOPE="all"
+  if [ "$RS" != "1" ]; then
+    local IDX=$((RS-2))
+    [ "$IDX" -ge 0 ] && [ "$IDX" -lt ${#INSTALLED[@]} ] || return 0
+    SCOPE="${INSTALLED[$IDX]%%|*}"
+  fi
+
+  local LIST_TMP; LIST_TMP=$(mktemp)
+  zstd -dc "$PICK" | tar -tf - | python3 - "$SCOPE" << 'PY' > "$LIST_TMP"
 import sys
-scope = sys.argv[1]
+scope = sys.argv[1].lower()
+aliases = {"freebuff": ("freebuff", "manicode")}
+keys = aliases.get(scope, (scope,))
 for line in sys.stdin:
     p = line.rstrip("\n")
-    low = p.lower()
-    is_oc = ("opencode" in low)
-    is_fb = ("freebuff" in low or "manicode" in low)
-    if scope == "both":
+    if scope == "all" or any(k in p.lower() for k in keys):
         print(p)
-    elif scope == "opencode" and is_oc:
-        print(p)
-    elif scope == "freebuff" and is_fb:
-        print(p)
-' "$TOOL_SCOPE" > "$LIST_TMP"
+PY
 
   if [ ! -s "$LIST_TMP" ]; then
     rm -f "$LIST_TMP"
-    echo -e "  ${Y}●${Z} Archive does not contain any ${TOOL_SCOPE} files.\n"
+    echo -e "  ${Y}●${Z} Archive contains no ${SCOPE} files.\n"
+    [ "$CLI_MODE" -eq 1 ] && return 1
+    back_to_menu_loader; return 0
+  fi
+
+  printf "  ${Y}›${Z} Restore ${B}${SCOPE}${Z} from $(basename "$PICK")? [y/N]: "; read -r OK
+  if [[ "$OK" =~ ^[yY] ]]; then
+    echo ""
+    draw_progress 25 "Decompressing $(basename "$PICK")..."
+    zstd -dc "$PICK" | tar -C / -xf - -T "$LIST_TMP" &
+    local EPID=$!
+    local P=35
+    while kill -0 "$EPID" 2>/dev/null; do
+      draw_progress "$P" "Extracting ${SCOPE} files..."
+      P=$(( P + 12 )); [ "$P" -gt 92 ] && P=92
+      sleep 0.15
+    done
+    wait "$EPID"
+    chmod +x /usr/local/bin/oc-auto 2>/dev/null || true
+    draw_progress 100 "Restored ${SCOPE} cleanly"
+    echo ""
+  else
+    echo -e "  ${D}Restore cancelled.${Z}\n"
+  fi
+  rm -f "$LIST_TMP"
+}
+
+# --- User-Controlled Multi-Agent Bridge Flow ---
+uninstall_ocb() {
+  echo -e "\n  ${B}uninstall ocb${Z}\n  ${D}------------------------------------------${Z}"
+  echo -e "  ${Y}Will remove:${Z}"
+  echo -e "   • /usr/local/bin/oc-auto (Ubuntu proot engine)"
+  echo -e "   • ~/.config/ocb (agent registry & settings)"
+  echo -e "   • \$PREFIX/bin/ocb (Termux wrapper command)"
+  echo -e "\n  ${G}Will preserve:${Z}"
+  echo -e "   • Download/TOOL BACKUP (.tzst archives)"
+  echo -e "   • All AI agent configs, databases & project Git repos\n"
+
+  printf "  ${C}›${Z} Type ${B}UNINSTALL${Z} to confirm (or anything else to cancel): " >/dev/tty
+  IFS= read -r CONF </dev/tty || exit 130
+  if [ "$CONF" != "UNINSTALL" ]; then
+    echo -e "  ${D}Uninstall cancelled.${Z}\n"
+    return 0
+  fi
+
+  rm -rf "$HOME/.config/ocb"
+  rm -f /usr/local/bin/oc-auto
+  echo -e "  ${G}✓${Z} Removed Ubuntu engine and config."
+  exit 99
+}
+
+run_bridge_wizard() {
+  local SRC_AGENT="${1:-}" TGT_AGENT="${2:-}" FORCE_NEW="${3:-0}"
+  run_with_spinner "Scanning installed CLI agents..." detect_installed_agents
+  mapfile -t AGENTS <<< "$SPINNER_OUT"
+
+  if [ ${#AGENTS[@]} -eq 0 ]; then
+    echo -e "  ${R}●${Z} No supported agents found on PATH. Edit ${B}$AGENTS_CFG${Z} to register tools.\n"
     return 1
   fi
 
-  printf "  ${Y}›${Z} Restore ${B}${TOOL_SCOPE}${Z} from $(basename "$PICK")? [y/N]: "; read -r OK
-  case "$OK" in
-    y|Y|yes|YES)
-      echo -e "  ${C}●${Z} Extracting ${TOOL_SCOPE}..."
-      zstd -dc "$PICK" | tar -C / -xf - -T "$LIST_TMP"
-      chmod +x /usr/local/bin/oc-auto 2>/dev/null || true
-      echo -e "  ${G}✓${Z} Restored ${B}${TOOL_SCOPE}${Z} cleanly.\n"
-      ;;
-    *)
-      echo -e "  ${D}Restore cancelled.${Z}\n"
-      ;;
-  esac
-  rm -f "$LIST_TMP"
-}
-[ "${NEED_BACKUP:-0}" -eq 1 ] && { run_tool_backup; exit 0; }
-[ "${NEED_RESTORE:-0}" -eq 1 ] && { run_tool_restore; exit 0; }
-run_git_health() {
-  local B="\033[1m" D="\033[2m" G="\033[32m" Y="\033[33m" R="\033[31m" C="\033[36m" Z="\033[0m" ISS=0
-  echo -e "\n  ${B}git health${Z} ${D}· $(basename "$CWD_REAL")${Z}\n  ${D}──────────────────────────────────────────${Z}"
-  [ ! -d ".git" ] && echo -e "  ${Y}●${Z} No .git repo yet.\n" && return 0
-  git ls-files >/dev/null 2>&1 && echo -e "  ${G}●${Z} Index      ${D}readable${Z}" || { echo -e "  ${R}●${Z} Index      ${R}corrupted${Z}"; ISS=$((ISS+1)); }
-  if git rev-parse --verify HEAD >/dev/null 2>&1; then
-    echo -e "  ${G}●${Z} HEAD       ${D}$(git rev-parse --short HEAD) ($(git branch --show-current 2>/dev/null || echo detached))${Z}"
-  else
-    echo -e "  ${Y}●${Z} HEAD       ${D}no commits${Z}"
-  fi
-  [ -z "$(find .git -name '*.lock' -type f 2>/dev/null)" ] && echo -e "  ${G}●${Z} Locks      ${D}none${Z}" || { echo -e "  ${R}●${Z} Locks      ${R}stale .lock found${Z}"; ISS=$((ISS+1)); }
-  if [ -f ".git/oc-bridge.pid" ]; then
-    local P=$(cat .git/oc-bridge.pid 2>/dev/null || echo "")
-    [ -n "$P" ] && kill -0 "$P" 2>/dev/null && echo -e "  ${C}●${Z} Bridge PID ${D}active tab ($P)${Z}" || { echo -e "  ${Y}●${Z} Bridge PID ${D}stale ($P)${Z}"; ISS=$((ISS+1)); }
-  else
-    echo -e "  ${G}●${Z} Bridge PID ${D}clean${Z}"
-  fi
-  local TI="missing"; git rev-parse --verify opencode-latest >/dev/null 2>&1 && TI=$(git rev-parse --short opencode-latest)
-  local FB="clean"; git show-ref --verify --quiet refs/heads/freebuff-fallback && FB="pending merge"
-  echo -e "  ${C}●${Z} Refs       ${D}baseline:$TI · fallback:$FB${Z}"
-  git fsck --no-dangling >/dev/null 2>&1 && echo -e "  ${G}●${Z} Object DB  ${D}fsck passed${Z}" || { echo -e "  ${R}●${Z} Object DB  ${R}fsck error${Z}"; ISS=$((ISS+1)); }
-  echo -e "  ${D}● Worktree   $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted item(s)${Z}\n  ${D}──────────────────────────────────────────${Z}"
-  if [ "$ISS" -gt 0 ]; then
-    printf "  Repair %d issue(s)? [y/N]: " "$ISS"; read -r ANS
-    if [ "$ANS" = "y" ] || [ "$ANS" = "Y" ]; then
-      find .git -name "*.lock" -type f -delete 2>/dev/null || true
-      rm -f .git/oc-bridge.pid
-      if ! git ls-files >/dev/null 2>&1; then
-        mv .git ".git.corrupt.$(date +%s)"; git init -q; git add -A
-        git commit -m "chore: recovered clean repo" --allow-empty -q; git tag -f opencode-latest HEAD
-      fi
-      echo -e "  ${G}✓${Z} Repaired."
-    fi
-  else
-    echo -e "  ${G}✓${Z} Repository healthy."
-  fi; echo ""
-}
-[ "${NEED_BACKUP:-0}" -eq 1 ] && { run_tool_backup; exit 0; }
-[ "${NEED_RESTORE:-0}" -eq 1 ] && { run_tool_restore; exit 0; }
-[ "${1:-}" = "--health" ] && { run_git_health; exit 0; }
-SELECTED_SID=""; SELECTED_FB_ID=""; SELECTED_FB_PATH=""; SELECTED_TITLE=""; SELECTED_DIR=""; ACTION_MODE="auto"; SKIP_GIT_OPS=0
-
-if [ $# -eq 0 ] && [ -t 0 ]; then
-  while true; do
-  B="\033[1m"; D="\033[2m"; P="\033[35m"; C="\033[36m"; Z="\033[0m"; DOT="${P}●${Z}"
-  COLS=$(tput cols 2>/dev/null || echo 56); [ "$COLS" -gt 64 ] && COLS=64; [ "$COLS" -lt 36 ] && COLS=36
-  RULE=$(printf "%*s" "$((COLS - 4))" "" | tr " " "-")
-  MAX_T=$((COLS - 26)); [ "$MAX_T" -lt 16 ] && MAX_T=16
-
-  echo ""
-  echo -e "  ${P}█▀▀█ █▀▀ █▀▀▄${Z}   ${B}ocb${Z} ${C}v${VERSION}${Z}"
-  echo -e "  ${P}█  █ █   █▀▀▄${Z}   ${D}cross-agent bridge · $(basename "$CWD_REAL")${Z}"
-  echo -e "  ${P}▀▀▀▀ ▀▀▀ ▀▀▀ ${Z}   ${D}$(printf "%*s" "$((COLS - 19))" "" | tr " " "-")${Z}"
-  OC_S=(); while IFS= read -r l; do [ -n "$l" ] && OC_S+=("$l"); done < <(list_recent_opencode_sessions)
-  FB_S=(); while IFS= read -r l; do [ -n "$l" ] && FB_S+=("$l"); done < <(list_recent_freebuff_sessions)
-
-  IDX=1; declare -a M_TYPE M_ID M_TITLE M_DIR M_PATH
-  if [ ${#OC_S[@]} -gt 0 ]; then
-    echo -e "\n  ${D}OPENCODE  ->  FREEBUFF${Z}"
-    for R in "${OC_S[@]}"; do
-      SID="${R%%|*}"; T1="${R#*|}"; TT="${T1%%|*}"; T2="${T1#*|}"; TS="${T2%%|*}"; DR="${T2#*|}"
-      echo -e "  ${B}[$IDX]${Z} $(echo "$TT" | cut -c 1-"$MAX_T") ${D}· $(basename "$DR") · $(echo "$TS" | cut -c 6-16)${Z}"
-      echo -e "      $DOT ${D}Hand off OpenCode context & diff to Freebuff${Z}"
-      M_TYPE[$IDX]="oc_to_fb"; M_ID[$IDX]="$SID"; M_TITLE[$IDX]="$TT"; M_DIR[$IDX]="$DR"; IDX=$((IDX+1))
+  # 1. Select Source Agent if not supplied via CLI
+  if [ -z "$SRC_AGENT" ]; then
+    echo -e "\n  ${B}step 1/3 · choose source tool${Z}\n  ${D}------------------------------------------${Z}"
+    local I=1
+    for ROW in "${AGENTS[@]}"; do
+      IFS="|" read -r K L P _ <<< "$ROW"
+      echo -e "  ${B}[$I]${Z} $L ${D}· $K ($P)${Z}"
+      I=$((I+1))
     done
-  fi
-  if [ ${#FB_S[@]} -gt 0 ]; then
-    echo -e "\n  ${D}FREEBUFF  ->  OPENCODE${Z}"
-    for R in "${FB_S[@]}"; do
-      FBS="${R%%|*}"; T1="${R#*|}"; PR="${T1%%|*}"; T2="${T1#*|}"; TS="${T2%%|*}"; T3="${T2#*|}"; FP="${T3%%|*}"; FJ="${T3#*|}"
-      echo -e "  ${B}[$IDX]${Z} $(echo "$PR" | cut -c 1-"$MAX_T") ${D}· $FJ · $TS${Z}"
-      echo -e "      $DOT ${D}Hand off Freebuff thread & diff to OpenCode${Z}"
-      M_TYPE[$IDX]="fb_to_oc"; M_ID[$IDX]="$FBS"; M_TITLE[$IDX]="$PR"; M_PATH[$IDX]="$FP"; M_DIR[$IDX]="$FJ"; IDX=$((IDX+1))
-    done
+    echo -e "  ${B}[$I]${Z} Back to main menu"
+    SC=$(read_choice "  ${C}›${Z} Source tool [1-${I}]: " 1 "$I"); [ "$SC" = "CANCEL" ] && return 0
+    [ "$SC" = "$I" ] || [ "$SC" = "q" ] && return 0
+    SRC_AGENT="${AGENTS[$((SC-1))]%%|*}"
   fi
 
-  echo ""
-  O_NEW=$IDX; O_HLT=$((IDX+1)); O_BKP=$((IDX+2)); O_RST=$((IDX+3)); O_EXT=$((IDX+4))
-  echo -e "  ${D}WORKSPACE${Z}"
-  echo -e "  ${B}[$O_NEW]${Z} New session"
-  echo -e "      $DOT ${D}Start clean in current or new ~/projects/ folder${Z}"
-  echo -e "  ${B}[$O_HLT]${Z} Git health"
-  echo -e "      $DOT ${D}Audit index, locks, branches & object integrity${Z}"
-  echo -e "  ${B}[$O_BKP]${Z} Backup tools"
-  echo -e "      $DOT ${D}Archive OpenCode & Freebuff (.tzst) to Download${Z}"
-  echo -e "  ${B}[$O_RST]${Z} Restore tools"
-  echo -e "      $DOT ${D}Restore OpenCode & Freebuff from Download/TOOL BACKUP${Z}"
-  echo -e "  ${B}[$O_EXT]${Z} Exit"
-  echo -e "      $DOT ${D}Close without launching an agent${Z}"
-  echo -e "  ${D}${RULE}${Z}"
-  printf "  ${C}›${Z} Select [1-%d, Enter=1]: " "$O_EXT"; read -r CH; CH="${CH:-1}"
-
-  if [ "$CH" = "$O_EXT" ] || [ "$CH" = "q" ] || [ "$CH" = "exit" ]; then exit 0
-  elif [ "$CH" = "$O_HLT" ]; then run_git_health; exit 0
-  elif [ "$CH" = "$O_BKP" ]; then run_tool_backup; continue
-  elif [ "$CH" = "$O_RST" ]; then run_tool_restore; continue
-  elif [ "$CH" = "$O_NEW" ]; then
-    ACTION_MODE="new"
-    printf "  ${C}›${Z} Folder name (Enter = keep $(basename "$CWD_REAL")): "; read -r NP
-    [ -n "$NP" ] && { TD="$PROJECTS_ROOT/$(slugify "$NP")"; mkdir -p "$TD"; cd "$TD"; }
-  elif [ "${M_TYPE[$CH]:-}" = "oc_to_fb" ]; then
-    SELECTED_SID="${M_ID[$CH]}"; SELECTED_TITLE="${M_TITLE[$CH]}"; SELECTED_DIR="${M_DIR[$CH]}"; ACTION_MODE="oc_to_fb"
-    if [ "$SELECTED_DIR" = "/root" ] || [ "$SELECTED_DIR" = "$PROJECTS_ROOT" ] || [ "$SELECTED_DIR" = "$HOME" ] || [ "$SELECTED_DIR" = "$TERMUX_HOME" ] || [ ! -d "$SELECTED_DIR" ]; then
-      SL=$(slugify "$SELECTED_TITLE"); [ -z "$SL" ] && SL="session-${SELECTED_SID:0:8}"
-      TD="$PROJECTS_ROOT/$SL"; [ "$CWD_REAL" != "$TD" ] && { mkdir -p "$TD"; cd "$TD"; }
-    elif [ "$(cd "$SELECTED_DIR" && pwd -P)" != "$CWD_REAL" ]; then cd "$SELECTED_DIR"; fi
-  elif [ "${M_TYPE[$CH]:-}" = "fb_to_oc" ]; then
-    SELECTED_FB_ID="${M_ID[$CH]}"; SELECTED_FB_PATH="${M_PATH[$CH]}"; SELECTED_TITLE="${M_TITLE[$CH]}"; FJ="${M_DIR[$CH]}"; ACTION_MODE="fb_to_oc"
-    [ -n "$FJ" ] && [ "$FJ" != "root" ] && [ "$FJ" != "test" ] && { TD="$PROJECTS_ROOT/$FJ"; [ "$CWD_REAL" != "$TD" ] && { mkdir -p "$TD"; cd "$TD"; }; }
-  else
-    continue
-  fi
-  break
+  # 2. Select Source Session
+  run_with_spinner "Loading ${SRC_AGENT} sessions..." list_agent_sessions "$SRC_AGENT"
+  mapfile -t SESSIONS <<< "$SPINNER_OUT"
+  echo -e "\n  ${B}step 2/3 · choose ${SRC_AGENT} session${Z}\n  ${D}------------------------------------------${Z}"
+  local J=1
+  for SROW in "${SESSIONS[@]}"; do
+    IFS="|" read -r SID STITLE SPROJ STS <<< "$SROW"
+    echo -e "  ${B}[$J]${Z} $STITLE ${D}· $SPROJ · $STS${Z}"
+    J=$((J+1))
   done
-fi
+  echo -e "  ${B}[$J]${Z} Cancel"
+  SSC=$(read_choice "  ${C}›${Z} Session [1-${J}]: " 1 "$J"); [ "$SSC" = "CANCEL" ] && return 0
+  [ "$SSC" = "$J" ] || [ "$SSC" = "q" ] && return 0
+  local PICK_SID="${SESSIONS[$((SSC-1))]%%|*}"
 
-CWD_REAL=$(pwd -P); CWD_PATH="$(pwd)"
-PROJ_SLUG=$(basename "$CWD_REAL")
-if [ ! -f ".freebuff/project-id" ] && [ -f "$HOME/projects/$PROJ_SLUG/.freebuff/project-id" ]; then
-  mkdir -p .freebuff && cp "$HOME/projects/$PROJ_SLUG/.freebuff/project-id" .freebuff/project-id
-fi
-git config user.name >/dev/null 2>&1 || git config --global user.name "ocb-user"
-git config user.email >/dev/null 2>&1 || git config --global user.email "ocb@local"
-git config --global core.fsync none; git config --global core.preloadIndex false; git config --global gc.auto 0
-[ ! -d ".git" ] && git init -q
-
-PIDF=".git/oc-bridge.pid"
-if [ -f "$PIDF" ]; then
-  EP=$(cat "$PIDF" 2>/dev/null || echo "")
-  [ -n "$EP" ] && kill -0 "$EP" 2>/dev/null && SKIP_GIT_OPS=1 || rm -f "$PIDF"
-fi
-[ "$SKIP_GIT_OPS" -eq 0 ] && { echo $$ > "$PIDF"; trap 'rm -f "$PIDF"' EXIT INT TERM; }
-find .git -name "*.lock" -type f -delete 2>/dev/null || true
-
-if [ -f .git/index ] && ! git ls-files >/dev/null 2>&1; then
-  mv .git ".git.corrupt.$(date +%s)"; git init -q
-  [ "$SKIP_GIT_OPS" -eq 0 ] && echo $$ > "$PIDF"
-  git add -A; git commit -m "chore: recovered clean repo" --allow-empty -q
-fi
-mkdir -p .git/info
-for E in ".bridge-handoff.md" ".freebuff/" ".git.corrupt.*" "node_modules/" ".gradle/" "build/" "dist/"; do
-  grep -qxF "$E" .git/info/exclude 2>/dev/null || echo "$E" >> .git/info/exclude
-done
-git rev-parse --verify HEAD >/dev/null 2>&1 || { git add -A; git commit -m "chore: baseline" --allow-empty -q; }
-git rev-parse --verify opencode-latest >/dev/null 2>&1 || git tag -f opencode-latest HEAD
-
-if [ "$ACTION_MODE" = "oc_to_fb" ]; then
-  echo -e "\033[2m[ocb] OpenCode -> Freebuff in $(basename "$CWD_REAL")...\033[0m"
-  WF=$(git status --short); WD=$(git diff -U3 HEAD 2>/dev/null | head -n 300); OC=$(extract_opencode_context "$SELECTED_SID")
-  if [ "$SKIP_GIT_OPS" -eq 0 ]; then
-    git add -A; git commit -m "checkpoint: pre-freebuff" --allow-empty -q; git tag -f opencode-latest HEAD
-    git checkout -B opencode-main opencode-latest -q; git branch -D freebuff-fallback -q 2>/dev/null || true
-    git checkout -B freebuff-fallback opencode-latest -q
+  # 3. Select Target Agent if not supplied via CLI
+  if [ -z "$TGT_AGENT" ]; then
+    echo -e "\n  ${B}step 3/3 · choose target tool${Z}\n  ${D}------------------------------------------${Z}"
+    local K_IDX=1
+    local CANDS=()
+    for ROW in "${AGENTS[@]}"; do
+      IFS="|" read -r K L P _ <<< "$ROW"
+      [ "$K" = "$SRC_AGENT" ] && [ ${#AGENTS[@]} -gt 1 ] && continue
+      CANDS+=("$K")
+      echo -e "  ${B}[$K_IDX]${Z} $L ${D}· hand off into $K${Z}"
+      K_IDX=$((K_IDX+1))
+    done
+    echo -e "  ${B}[$K_IDX]${Z} Cancel"
+    TC=$(read_choice "  ${C}›${Z} Target tool [1-${K_IDX}]: " 1 "$K_IDX"); [ "$TC" = "CANCEL" ] && return 0
+    [ "$TC" = "$K_IDX" ] || [ "$TC" = "q" ] && return 0
+    TGT_AGENT="${CANDS[$((TC-1))]}"
   fi
-  printf "# OpenCode -> Freebuff Handoff\nSession: %s (%s)\n\n## Modified Files\n\`\`\`\n%s\n\`\`\`\n\n## Context\n%s\n\n## Diff\n\`\`\`diff\n%s\n\`\`\`\n" \
-    "$SELECTED_TITLE" "$(date -u +'%Y-%m-%d %H:%M UTC')" "${WF:-None}" "$OC" "${WD:-None}" > .bridge-handoff.md
-  FB_LIST=($(ls -1dt ~/.config/manicode/projects/"$PROJ_SLUG"/chats/* 2>/dev/null | xargs -n1 basename 2>/dev/null))
-  if [ ${#FB_LIST[@]} -gt 1 ]; then
-    echo -e "\n  \033[2mSelect target Freebuff session to resume:\033[0m"
-    I=1; for S in "${FB_LIST[@]}"; do echo -e "  \033[1m[$I]\033[0m $S"; I=$((I+1)); done
-    echo -e "  \033[1m[$I]\033[0m Start new Freebuff session"
-    printf "  \033[36m›\033[0m Choice [1-%d, Enter=1]: " "$I"; read -r FC; FC="${FC:-1}"
-    if [ "$FC" -lt "$I" ] 2>/dev/null; then
-      freebuff --continue "${FB_LIST[$((FC-1))]}"
-    else
-      freebuff
-    fi
-  elif [ ${#FB_LIST[@]} -eq 1 ]; then
-    freebuff --continue "${FB_LIST[0]}"
-  else
-    freebuff
-  fi
-  [ "$SKIP_GIT_OPS" -eq 0 ] && { find .git -name "*.lock" -type f -delete 2>/dev/null || true; git add -A; git commit -m "checkpoint: freebuff" --allow-empty -q; }
-  exit 0
-fi
 
-echo -e "\033[2m[ocb] Probing OpenCode (${PROBE_TIMEOUT}s max)...\033[0m"
-set +e; PO=$(timeout -k 3s "${PROBE_TIMEOUT}s" opencode run "Reply READY" 2>&1); PE=$?; set -e
-[ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1 && sqlite3 "$DB_PATH" "DELETE FROM session WHERE id IN (SELECT m.session_id FROM message m JOIN part p ON p.message_id = m.id WHERE json_extract(p.data, '$.type') = 'text' AND trim(json_extract(p.data, '$.text')) = 'Reply READY');" 2>/dev/null || true
-
-if [ "$PE" -eq 0 ] && echo "$PO" | grep -qi "READY"; then
-  if [ "$ACTION_MODE" = "fb_to_oc" ]; then
-    FC=$(extract_freebuff_context "$SELECTED_FB_PATH"); FF=$(git status --short); FD=$(git diff -U3 HEAD 2>/dev/null | head -n 250)
-    if [ "$SKIP_GIT_OPS" -eq 0 ] && git show-ref --verify --quiet refs/heads/freebuff-fallback; then
-      git checkout freebuff-fallback -q; git add -A; git commit -m "wip: freebuff" --allow-empty -q
-      FF=$(git diff --name-status opencode-latest..freebuff-fallback 2>/dev/null || echo "$FF")
-      FD=$(git diff -U3 opencode-latest..freebuff-fallback 2>/dev/null | head -n 250)
-      git checkout -B opencode-main -q; git merge freebuff-fallback --no-edit -q || true; git branch -D freebuff-fallback -q
-    elif [ "$SKIP_GIT_OPS" -eq 0 ]; then git checkout -B opencode-main -q; fi
-    printf "# Freebuff -> OpenCode Handoff\nSession: %s (%s)\n\n## Context\n%s\n\n## Modified Files\n\`\`\`\n%s\n\`\`\`\n\n## Diff\n\`\`\`diff\n%s\n\`\`\`\n" \
-      "$SELECTED_FB_ID" "$(date -u +'%Y-%m-%d %H:%M UTC')" "$FC" "${FF:-None}" "${FD:-None}" > .bridge-handoff.md
-  elif [ "$SKIP_GIT_OPS" -eq 0 ]; then git checkout -B opencode-main -q; rm -f .bridge-handoff.md; fi
-  [ "$SKIP_GIT_OPS" -eq 0 ] && { git add -A; git commit -m "checkpoint: opencode-main" --allow-empty -q; git tag -f opencode-latest HEAD; }
-  set +e
-  if [ "$ACTION_MODE" = "fb_to_oc" ]; then
-    OC_ROWS=(); while IFS= read -r r; do [ -n "$r" ] && OC_ROWS+=("$r"); done < <(list_recent_opencode_sessions)
-    if [ ${#OC_ROWS[@]} -gt 1 ]; then
-      echo -e "\n  \033[2mSelect target OpenCode session to resume:\033[0m"
-      I=1; declare -a OC_IDS
-      for R in "${OC_ROWS[@]}"; do
-        OID="${R%%|*}"; T1="${R#*|}"; OTT="${T1%%|*}"; T2="${T1#*|}"; OTS="${T2%%|*}"; ODR="${T2#*|}"
-        echo -e "  \033[1m[$I]\033[0m $OTT \033[2m· $(basename "$ODR") · $(echo "$OTS" | cut -c 6-16)\033[0m"
-        OC_IDS[$I]="$OID"; I=$((I+1))
+  # 4. Resume existing target thread or start new
+  local TGT_SID="new"
+  if [ "$FORCE_NEW" -eq 0 ]; then
+    run_with_spinner "Checking ${TGT_AGENT} threads..." list_agent_sessions "$TGT_AGENT"
+    mapfile -t TSESSIONS <<< "$SPINNER_OUT"
+    if [ ${#TSESSIONS[@]} -gt 1 ]; then
+      echo -e "\n  ${D}Target ${TGT_AGENT} thread:${Z}"
+      echo -e "  ${B}[1]${Z} New fresh thread"
+      local M=2
+      for TROW in "${TSESSIONS[@]}"; do
+        IFS="|" read -r TSID TTITLE TPROJ TTS <<< "$TROW"
+        [ "$TSID" = "git-diff" ] && continue
+        echo -e "  ${B}[$M]${Z} Resume: $TTITLE ${D}· $TTS${Z}"
+        M=$((M+1))
       done
-      echo -e "  \033[1m[$I]\033[0m Start new OpenCode session"
-      printf "  \033[36m›\033[0m Choice [1-%d, Enter=1]: " "$I"; read -r OCC; OCC="${OCC:-1}"
-      if [ "$OCC" -lt "$I" ] 2>/dev/null && [ -n "${OC_IDS[$OCC]:-}" ]; then
-        opencode -s "${OC_IDS[$OCC]}"
-      else
-        opencode
+      THC=$(read_choice "  ${C}›${Z} Thread [1-$((M-1))]: " 1 "$((M-1))"); [ "$THC" = "CANCEL" ] && return 0
+      if [ "$THC" -gt 1 ] 2>/dev/null; then
+        TGT_SID="${TSESSIONS[$((THC-2))]%%|*}"
       fi
-    elif [ ${#OC_ROWS[@]} -eq 1 ]; then
-      opencode -s "${OC_ROWS[0]%%|*}"
-    else
-      opencode
     fi
-  elif [ "$ACTION_MODE" = "new" ]; then
-    opencode
-  else
-    opencode "$@"
   fi
-  OE=$?; set -e
-  [ "$SKIP_GIT_OPS" -eq 0 ] && { find .git -name "*.lock" -type f -delete 2>/dev/null || true; git add -A; git commit -m "checkpoint: opencode" --allow-empty -q; git tag -f opencode-latest HEAD; }
-  exit "$OE"
-else
-  echo -e "\033[2m[ocb] OpenCode unavailable — falling back to Freebuff...\033[0m"
-  WF=$(git status --short); WD=$(git diff -U3 HEAD 2>/dev/null | head -n 300); OC=$(extract_opencode_context "")
-  if [ "$SKIP_GIT_OPS" -eq 0 ]; then
-    git checkout -B opencode-main opencode-latest -q; git branch -D freebuff-fallback -q 2>/dev/null || true; git checkout -B freebuff-fallback opencode-latest -q
-  fi
-  printf "# OpenCode -> Freebuff Fallback\nTime: %s\n\n## Modified Files\n\`\`\`\n%s\n\`\`\`\n\n## Context\n%s\n\n## Diff\n\`\`\`diff\n%s\n\`\`\`\n" \
-    "$(date -u +'%Y-%m-%d %H:%M UTC')" "${WF:-None}" "$OC" "${WD:-None}" > .bridge-handoff.md
-  FB_LIST=($(ls -1dt ~/.config/manicode/projects/"$PROJ_SLUG"/chats/* 2>/dev/null | xargs -n1 basename 2>/dev/null))
-  if [ ${#FB_LIST[@]} -gt 1 ]; then
-    echo -e "\n  \033[2mSelect target Freebuff session to resume:\033[0m"
-    I=1; for S in "${FB_LIST[@]}"; do echo -e "  \033[1m[$I]\033[0m $S"; I=$((I+1)); done
-    echo -e "  \033[1m[$I]\033[0m Start new Freebuff session"
-    printf "  \033[36m›\033[0m Choice [1-%d, Enter=1]: " "$I"; read -r FC; FC="${FC:-1}"
-    if [ "$FC" -lt "$I" ] 2>/dev/null; then
-      freebuff --continue "${FB_LIST[$((FC-1))]}"
-    else
-      freebuff
-    fi
-  elif [ ${#FB_LIST[@]} -eq 1 ]; then
-    freebuff --continue "${FB_LIST[0]}"
-  else
-    freebuff
-  fi
-  [ "$SKIP_GIT_OPS" -eq 0 ] && { find .git -name "*.lock" -type f -delete 2>/dev/null || true; git add -A; git commit -m "checkpoint: freebuff" --allow-empty -q; }
-fi
+
+  build_handoff_package "$SRC_AGENT" "$PICK_SID" "$TGT_AGENT"
+  launch_target_agent "$TGT_AGENT" "$TGT_SID"
+}
+
+# --- Direct CLI Control Subcommands ---
+case "${1:-}" in
+  -v|--version) echo "ocb v$VERSION"; exit 0 ;;
+  -h|--help)
+    echo "Usage: ocb [command]"
+    echo "  ocb                         Interactive user-controlled menu"
+    echo "  ocb bridge [src] [tgt]      Start cross-agent handoff (optional --new)"
+    echo "  ocb agents                  List detected tools & config path"
+    echo "  ocb backup [all|<agent>]    Create .tzst backup in Download/TOOL BACKUP"
+    echo "  ocb restore                 Restore tools from Download/TOOL BACKUP"
+    echo "  ocb health                  Audit Git index, locks & checkpoint tags"
+    exit 0 ;;
+  agents)
+    run_with_spinner "Detecting installed agents..." detect_installed_agents
+    echo -e "\n  ${B}detected agents${Z} ${D}· $AGENTS_CFG${Z}\n  ${D}------------------------------------------${Z}"
+    while IFS="|" read -r K L P PARSER; do
+      [ -z "$K" ] && continue
+      echo -e "  ${G}●${Z} ${B}$L${Z} ($K) ${D}→ $P [$PARSER]${Z}"
+    done <<< "$SPINNER_OUT"
+    echo ""; exit 0 ;;
+  bridge)
+    FORCE_NEW=0; [[ "${4:-}" = "--new" || "${3:-}" = "--new" ]] && FORCE_NEW=1
+    SRC="${2:-}"; TGT="${3:-}"; [ "$TGT" = "--new" ] && TGT=""
+    run_bridge_wizard "$SRC" "$TGT" "$FORCE_NEW"; exit 0 ;;
+  --health|health) run_git_health; exit 0 ;;
+  --backup|backup) run_tool_backup "${2:-}"; exit 0 ;;
+  --restore|restore) run_tool_restore 1; exit 0 ;;
+esac
+
+# --- Interactive Control Menu ---
+while true; do
+  run_with_spinner "Scanning workspace & agents..." detect_installed_agents
+  mapfile -t DET <<< "$SPINNER_OUT"
+  DET_NAMES=$(printf "%s\n" "${DET[@]}" | cut -d"|" -f1 | paste -sd " · " -)
+  [ -z "$DET_NAMES" ] && DET_NAMES="none detected"
+
+  echo ""
+  echo -e "  ${M}█▀▀█ █▀▀ █▀▀▄${Z}   ${B}ocb${Z} ${C}v$VERSION${Z}"
+  echo -e "  ${M}█  █ █   █▀▀▄${Z}   ${D}cross-agent control · $(basename "$PWD")${Z}"
+  echo -e "  ${M}▀▀▀▀ ▀▀▀ ▀▀▀ ${Z}   ${D}tools: $DET_NAMES${Z}"
+  echo -e "  ${D}------------------------------------------${Z}\n"
+  echo -e "  ${D}HANDOFF CONTROL${Z}"
+  echo -e "  ${B}[1]${Z} Bridge agents"
+  echo -e "      $DOT ${D}Choose source tool, session & target tool${Z}\n"
+  echo -e "  ${D}WORKSPACE & TOOLS${Z}"
+  echo -e "  ${B}[2]${Z} New project folder"
+  echo -e "      $DOT ${D}Create/switch to ~/projects/<name> & init Git${Z}"
+  echo -e "  ${B}[3]${Z} Git health"
+  echo -e "      $DOT ${D}Audit index, stale locks & checkpoint tags${Z}"
+  echo -e "  ${B}[4]${Z} Backup tools"
+  echo -e "      $DOT ${D}Selective .tzst snapshot to Download/TOOL BACKUP${Z}"
+  echo -e "  ${B}[5]${Z} Restore tools"
+  echo -e "      $DOT ${D}Selective restore from Download/TOOL BACKUP${Z}"
+  echo -e "  ${B}[6]${Z} Agents registry"
+  echo -e "      $DOT ${D}Inspect detected CLIs & ~/.config/ocb/agents.json${Z}"
+  echo -e "  ${B}[7]${Z} Uninstall ocb\n      ${D}• Remove ocb binary & config (keeps backups)${Z}"
+  echo -e "  ${B}[8]${Z} Exit"
+  echo -e "      $DOT ${D}Close without launching an agent${Z}"
+  echo -e "  ${D}------------------------------------------${Z}"
+  CH=$(read_choice "  ${C}›${Z} Select [1-8]: " 1 8); [ "$CH" = "CANCEL" ] && exit 0
+
+  case "$CH" in
+    1) run_bridge_wizard ;;
+    2)
+      printf "  ${C}›${Z} Project folder name under ~/projects/: "; read -r PNAME
+      if [ -n "$PNAME" ]; then
+        mkdir -p "$PROJECTS_ROOT/$PNAME" && cd "$PROJECTS_ROOT/$PNAME"
+        [ ! -d .git ] && git init -b main >/dev/null 2>&1 || true
+        echo -e "  ${G}✓${Z} Switched to ${B}$PWD${Z}\n"
+      fi ;;
+    3) run_git_health ;;
+    4) run_tool_backup ;;
+    5) run_tool_restore 0 ;;
+    6) "$0" agents ;;
+    7|q|Q) exit 0 ;;
+  esac
+done
