@@ -83,6 +83,12 @@ ocb --version   # Print installed ocb version
 
 ---
 
+## AI & Safety Disclaimer
+
+This project was developed with AI assistance. While `ocb` has been tested on Termux (Ubuntu `proot-distro`) and Linux environments, operations such as SQLite session pruning, Git index repairs, and `.tzst` archive restores modify local files and configurations. Always verify your backups before restoring over active setups. `ocb` is an independent community utility and is not officially affiliated with OpenCode or Freebuff.
+
+---
+
 ## License
 
 MIT
