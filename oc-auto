@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 trap 'printf "\n  \033[31m●\033[0m Stopped at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 B="\033[1m"; D="\033[2m"; G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; M="\033[35m"; Z="\033[0m"
 DOT="${M}●${Z}"
 
@@ -539,6 +539,85 @@ PY
   if [ -z "$GIT_SHORT" ] && [ -z "$GIT_DIFF" ]; then
     echo -e "\n  ${Y}●${Z} Working tree is clean — this handoff carries no in-flight changes."
     echo -e "  ${D}If work was half-finished, commit or stash it and re-run the bridge.${Z}"
+  fi
+
+  # --- Handoff ledger: remember this tree so the next bridge can spot a stale re-handoff. ---
+  local GIT_HEAD="" LEDGER_ADVICE=""
+  GIT_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || true)
+  if [ -n "$GIT_HEAD" ]; then
+    LEDGER_ADVICE=$(python3 - "$CFG_DIR/handoffs.json" "$TOP" "$SRC_AGENT" "$TGT_AGENT" "$GIT_HEAD" \
+      "$GIT_SHORT" "$GIT_DIFF"$'\n'"$UNTRACKED_MD" << 'PY'
+import hashlib, json, os, subprocess, sys, time
+
+path, top, src, tgt, head, status, fp_src = sys.argv[1:8]
+fp = hashlib.sha256(fp_src.encode("utf-8", "ignore")).hexdigest()
+changed = len([l for l in status.splitlines() if l.strip()])
+now = int(time.time())
+
+def ago_text(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+try:
+    with open(path) as f:
+        ledger = json.load(f)
+    if not isinstance(ledger, dict):
+        ledger = {}
+except Exception:
+    ledger = {}
+
+prev = ledger.get(top) or {}
+msg = ""
+if prev.get("fp") == fp:
+    msg = (f"Same tree as your last bridge ({ago_text(now - prev.get('ts', now))} ago, "
+           f"{prev.get('src', '?')} -> {prev.get('tgt', '?')}) — nothing has changed since.")
+elif prev:
+    ago = ago_text(now - prev.get("ts", now))
+    bits = []
+    if prev.get("head") and prev["head"] != head:
+        n = 0
+        try:
+            out = subprocess.run(["git", "-C", top, "rev-list", "--count", f"{prev['head']}..{head}"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            n = int(out or 0)
+        except Exception:
+            n = 0
+        if n > 0:
+            bits.append(f"{n} new commit(s)")
+    if prev.get("changed") != changed:
+        bits.append(f"{changed} changed path(s), up from {prev.get('changed', 0)}" if changed > prev.get("changed", 0)
+                    else f"{changed} changed path(s), down from {prev.get('changed', 0)}")
+    if not bits:
+        bits.append("same path count, different diff")
+    msg = f"Since your last bridge ({ago} ago): " + ", ".join(bits) + "."
+
+ledger[top] = {"ts": now, "src": src, "tgt": tgt, "head": head, "fp": fp, "changed": changed}
+if len(ledger) > 200:
+    ledger = dict(sorted(ledger.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:200])
+try:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(ledger, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+except Exception as ex:
+    msg = (msg + " ") if msg else ""
+    msg += f"(ledger not saved: {ex})"
+print(msg)
+PY
+)
+  fi
+  if [ -n "$LEDGER_ADVICE" ]; then
+    while IFS= read -r LEDGER_LINE; do
+      if [ -n "$LEDGER_LINE" ]; then
+        echo -e "  ${C}●${Z} ${LEDGER_LINE}"
+      fi
+    done <<< "$LEDGER_ADVICE"
   fi
 }
 

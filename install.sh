@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/isygold/ocb/v2.1"
+REPO_RAW="https://raw.githubusercontent.com/isygold/ocb/v2.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing ocb (OpenCode <-> Freebuff Bridge)..."
