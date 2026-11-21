@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 trap 'printf "\n  \033[31m●\033[0m Stopped at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 B="\033[1m"; D="\033[2m"; G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; M="\033[35m"; Z="\033[0m"
 DOT="${M}●${Z}"
 
@@ -10,8 +10,21 @@ CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ocb"
 AGENTS_CFG="$CFG_DIR/agents.json"
 PROJECTS_ROOT="$HOME/projects"
 
-cleanup_tty() { printf "\033[?25h" 2>/dev/null || true; }
-trap cleanup_tty EXIT INT TERM
+# Reject handoffs from home or filesystem root; never export personal inventory.
+is_protected_root() {
+  local target candidate
+  target=$(realpath "$1" 2>/dev/null) || return 1
+  for candidate in "/" "$HOME" "/root" "/data/data/com.termux/files/home"; do
+    [ -n "$candidate" ] && [ -d "$candidate" ] || continue
+    [ "$target" = "$(realpath "$candidate" 2>/dev/null)" ] && return 0
+  done
+  return 1
+}
+
+cleanup_tty() { printf "\033[?25h" 2>/dev/null >/dev/tty || true; }
+trap cleanup_tty EXIT
+trap 'cleanup_tty; exit 130' INT
+trap 'cleanup_tty; exit 143' TERM
 
 # --- Visual Progress Utilities ---
 draw_progress() {
@@ -47,7 +60,9 @@ run_with_spinner() {
   done
   set +e; wait "$PID"; local RC=$?; set -e
   printf "\r\033[K\033[?25h" 2>/dev/null || true
-  while IFS= read -r -t 0.01 -n 1 _ </dev/tty 2>/dev/null; do :; done
+  if [ -t 0 ]; then
+    while IFS= read -r -t 0.01 -n 1 _ </dev/tty 2>/dev/null; do :; done
+  fi
   SPINNER_OUT=$(cat "$TMP_OUT")
   rm -f "$TMP_OUT"
   if [ "$RC" -ne 0 ] && [ -n "$SPINNER_OUT" ]; then
@@ -182,29 +197,30 @@ def fmt_ts(ts):
 if parser == "sqlite_opencode":
     db = os.path.expanduser(meta.get("db", "~/.local/share/opencode/opencode.db"))
     if os.path.isfile(db):
-        con = sqlite3.connect(db)
-        cur = con.cursor()
-        # Clean probe-only sessions automatically
-        try:
-            cur.execute("""
-                DELETE FROM session WHERE id IN (
-                  SELECT m.session_id FROM message m JOIN part p ON p.message_id = m.id
-                  WHERE json_extract(p.data, '$.type') = 'text'
-                    AND trim(json_extract(p.data, '$.text')) IN ('Reply READY', 'READY')
-                )
-            """)
-            con.commit()
-        except Exception:
-            pass
-        rows = cur.execute("""
+        # Read-only: listing sessions must never mutate the agent database.
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = con.execute("""
             SELECT s.id, COALESCE(NULLIF(trim(s.title), ''), s.id), COALESCE(s.directory, ''), COALESCE(s.time_updated, s.time_created, 0)
             FROM session s
             WHERE EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
-            ORDER BY COALESCE(s.time_updated, s.time_created, 0) DESC LIMIT 12
+            ORDER BY COALESCE(s.time_updated, s.time_created, 0) DESC
         """).fetchall()
+        con.close()
+
+        current = []
+        other = []
         for sid, title, sdir, ts in rows:
+            sdir = os.path.expanduser(str(sdir or ""))
+            is_current = bool(sdir) and os.path.realpath(sdir) == cwd
             proj = os.path.basename(sdir.rstrip("/")) or "workspace"
-            print(f"{sid}|{title[:42]}|{proj}|{fmt_ts(ts)}")
+            title = str(title).replace("|", "/")[:42]
+            proj = proj.replace("|", "/") + ("*" if is_current else "")
+            item = (sid, title, proj, ts)
+            (current if is_current else other).append(item)
+
+        # Current workspace first; keep other sessions available as fallback.
+        for sid, title, proj, ts in (current + other)[:12]:
+            print(f"{sid}|{title}|{proj}|{fmt_ts(ts)}")
 
 elif parser == "manicode_json":
     root = os.path.expanduser(meta.get("sessions_dir", "~/.config/manicode/projects"))
@@ -219,15 +235,16 @@ elif parser == "manicode_json":
             mt = os.path.getmtime(cf)
             title = f"Chat {cid[:14]}"
             for msg in data:
-                if isinstance(msg, dict) and msg.get("role") == "user":
+                if isinstance(msg, dict) and (msg.get("role") or msg.get("variant")) == "user":
                     txt = str(msg.get("content", "")).strip().splitlines()[0]
                     if txt and not txt.startswith("Read .bridge-handoff.md"):
                         title = txt[:42]; break
-            found.append((mt, cid, title, proj))
+            is_current = proj == os.path.basename(cwd)
+            found.append((not is_current, -mt, cid, str(title).replace("|", "/")[:42], proj.replace("|", "/") + ("*" if is_current else "")))
         except Exception:
             pass
-    for mt, cid, title, proj in sorted(found, reverse=True)[:12]:
-        print(f"{cid}|{title}|{proj}|{fmt_ts(mt)}")
+    for _scope, _mt, cid, title, proj in sorted(found)[:12]:
+        print(f"{cid}|{title}|{proj}|{fmt_ts(-_mt)}")
 
 elif parser == "claude_jsonl":
     root = os.path.expanduser(meta.get("sessions_dir", "~/.claude/projects"))
@@ -236,11 +253,14 @@ elif parser == "claude_jsonl":
         try:
             if os.path.getsize(jf) < 50: continue
             sid = os.path.splitext(os.path.basename(jf))[0]
-            proj = os.path.basename(os.path.dirname(jf))[-20:]
+            pdir = os.path.basename(os.path.dirname(jf))
+            proj = pdir[-20:]
             mt = os.path.getmtime(jf)
             title = f"Session {sid[:12]}"
+            session_cwd = ""
             for line in open(jf):
                 obj = json.loads(line)
+                session_cwd = session_cwd or str(obj.get("cwd", "") or "")
                 if obj.get("type") == "user":
                     msg = obj.get("message", {})
                     c = msg.get("content", "") if isinstance(msg, dict) else str(msg)
@@ -248,11 +268,12 @@ elif parser == "claude_jsonl":
                         c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
                     c = str(c).strip().splitlines()[0]
                     if c: title = c[:42]; break
-            found.append((mt, sid, title, proj))
+            is_current = (bool(session_cwd) and os.path.realpath(session_cwd) == cwd) or (pdir == cwd.replace("/", "-"))
+            found.append((not is_current, -mt, sid, title.replace("|", "/")[:42], proj.replace("|", "/") + ("*" if is_current else "")))
         except Exception:
             pass
-    for mt, sid, title, proj in sorted(found, reverse=True)[:12]:
-        print(f"{sid}|{title}|{proj}|{fmt_ts(mt)}")
+    for _scope, _mt, sid, title, proj in sorted(found)[:12]:
+        print(f"{sid}|{title}|{proj}|{fmt_ts(-_mt)}")
 
 elif parser == "markdown_file":
     hf = os.path.join(cwd, meta.get("history_file", ".aider.chat.history.md"))
@@ -267,26 +288,76 @@ PY
 build_handoff_package() {
   local SRC_AGENT="$1" SRC_SID="$2" TGT_AGENT="$3"
   local OUT_MD="$PWD/.bridge-handoff.md"
+  local TOP
+  if ! TOP=$(git rev-parse --show-toplevel 2>/dev/null); then
+    echo -e "\n  ${R}●${Z} Refusing to create a handoff outside a Git worktree."
+    echo -e "  ${D}Open a project repository first, then run ocb again.${Z}"
+    return 1
+  fi
+  if is_protected_root "$PWD" || is_protected_root "$TOP"; then
+    echo -e "\n  ${R}●${Z} Refusing to hand off the home directory or filesystem root."
+    echo -e "  ${D}Run ocb from a project folder so home files are not exported.${Z}"
+    return 1
+  fi
   echo ""
   draw_progress 15 "Securing .git/info/exclude..."
-  if [ -d "$PWD/.git" ]; then
-    {
-      mkdir -p "$PWD/.git/info"
-      grep -qxF ".bridge-handoff.md" "$PWD/.git/info/exclude" 2>/dev/null || echo ".bridge-handoff.md" >> "$PWD/.git/info/exclude"
-      git tag -f opencode-latest >/dev/null 2>&1
-    } 2>/dev/null || true
-  fi
+  {
+    local EXCLUDE
+    EXCLUDE=$(git rev-parse --git-path info/exclude 2>/dev/null || echo "$TOP/.git/info/exclude")
+    mkdir -p "$(dirname "$EXCLUDE")"
+    grep -qxF ".bridge-handoff.md" "$EXCLUDE" 2>/dev/null || printf '%s\n' ".bridge-handoff.md" >> "$EXCLUDE"
+    git tag -f opencode-latest >/dev/null 2>&1 || true
+  } 2>/dev/null || true
   sleep 0.08
 
   draw_progress 45 "Extracting ${SRC_AGENT} session context..."
-  local CONTEXT_BODY
-  CONTEXT_BODY=$(python3 - "$AGENTS_CFG" "$SRC_AGENT" "$SRC_SID" "$PWD" << 'PY'
-import json, os, sys, glob, sqlite3
+  local CONTEXT_BODY TASK_BODY
+  CONTEXT_BODY=$(python3 - "$AGENTS_CFG" "$SRC_AGENT" "$SRC_SID" "$PWD" "$TOP" << 'PY'
+import json, os, sys, glob, sqlite3, re
 cfg = json.load(open(sys.argv[1]))
 key, sid, cwd = sys.argv[2], sys.argv[3], sys.argv[4]
+top = os.path.realpath(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else os.path.realpath(cwd)
 meta = cfg.get(key, {})
 parser = meta.get("parser", "git_diff")
 out = []
+last_agent_msg = ""
+outside_actions = 0
+SYSTEM_PREFIXES = ("/dev/", "/proc/", "/sys/", "/usr/", "/bin/", "/sbin/", "/etc/",
+                   "/sdcard/", "/system/", "/apex/", "/data/data/com.termux/files/usr/")
+
+def foreign_action(raw):
+    for p in re.findall(r"(/[^\s\"'`,;:)]+)", raw):
+        if p.startswith(SYSTEM_PREFIXES):
+            continue
+        if not os.path.realpath(os.path.dirname(p) or "/").startswith(top):
+            return True
+    return False
+
+def fb_role(msg):
+    r = str(msg.get("role") or msg.get("variant") or "msg").lower()
+    if r in ("ai", "assistant", "model"):
+        return "assistant"
+    return "user" if r in ("user", "human") else r
+
+def fb_text(msg):
+    txt = str(msg.get("content") or "").strip()
+    if txt:
+        return txt
+    blocks = msg.get("blocks") or []
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except Exception:
+            blocks = []
+    parts = []
+    if isinstance(blocks, list):
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("content"):
+                # textType='reasoning' marks private thinking; only keep real replies.
+                if str(b.get("textType") or "text") != "text":
+                    continue
+                parts.append(str(b["content"]))
+    return "\n".join(parts).strip()
 try:
     if sid != "git-diff":
         if parser == "sqlite_opencode":
@@ -299,14 +370,45 @@ try:
                        FROM message m JOIN part p ON p.message_id = m.id
                        WHERE m.session_id = ? ORDER BY m.rowid ASC, p.rowid ASC"""
                 touched = []
+                foreign = 0
+                seen_texts = set()
                 for role, ptype, body, tool, tinput in con.execute(q, (sid,)).fetchall()[-40:]:
                     if ptype == "text" and body:
-                        out.append("### " + str(role or "msg").upper() + "\n" + str(body).strip()[:1800])
+                        text = str(body).strip()
+                        seen_texts.add(text)
+                        out.append("### " + str(role or "msg").upper() + "\n" + text[:1800])
+                        if str(role or "") == "assistant":
+                            last_agent_msg = text
                     elif tool:
-                        inp = str(tinput or "")[:220]
-                        touched.append(f"- `{tool}`: {inp}")
+                        raw = str(tinput or "")
+                        if foreign_action(raw):
+                            foreign += 1
+                        else:
+                            touched.append(f"- `{tool}`: {raw[:220]}")
+                outside_actions = foreign
+                # The tail of a long session is mostly tool/step parts, so the last
+                # 40 rows can contain no message at all. Fetch messages explicitly.
+                texts = con.execute("""SELECT json_extract(m.data, '$.role'), json_extract(p.data, '$.text')
+                       FROM message m JOIN part p ON p.message_id = m.id
+                       WHERE m.session_id = ? AND json_extract(p.data, '$.type') = 'text'
+                         AND json_extract(m.data, '$.role') IN ('user', 'assistant')
+                         AND coalesce(json_extract(p.data, '$.text'), '') != ''
+                       ORDER BY m.rowid DESC, p.rowid DESC LIMIT 6""", (sid,)).fetchall()
+                con.close()
+                texts.reverse()
+                recent = []
+                for role, text in texts:
+                    text = str(text or "").strip()
+                    if not text or text in seen_texts:
+                        continue
+                    seen_texts.add(text)
+                    recent.append("#### " + str(role).upper() + "\n" + text[:900])
+                    if str(role) == "assistant":
+                        last_agent_msg = text
+                recent_blocks = (["### MOST RECENT MESSAGES (tail of session)\n" + "\n\n".join(recent)] if recent else [])
                 if touched:
-                    out.append("### OPENCODE TOOL & FILE ACTIONS (RECENT)\n" + "\n".join(touched[-20:]))
+                    recent_blocks.append("### OPENCODE TOOL & FILE ACTIONS IN THIS WORKSPACE (RECENT)\n" + "\n".join(touched[-20:]))
+                out[:0] = recent_blocks
         elif parser == "manicode_json":
             root = os.path.expanduser(meta.get("sessions_dir", "~/.config/manicode/projects"))
             m = glob.glob(os.path.join(root, "*", "chats", sid, "chat-messages.json"))
@@ -314,8 +416,15 @@ try:
                 raw = json.load(open(m[0]))
                 msgs = raw if isinstance(raw, list) else raw.get("messages", [])
                 for msg in msgs[-16:]:
-                    if isinstance(msg, dict) and msg.get("content"):
-                        out.append("### " + str(msg.get("role", "msg")).upper() + "\n" + str(msg["content"]).strip()[:1500])
+                    if not isinstance(msg, dict):
+                        continue
+                    role = fb_role(msg)
+                    text = fb_text(msg)
+                    if not text or role in ("system", "msg"):
+                        continue
+                    out.append("### " + role.upper() + "\n" + text[:1500])
+                    if role == "assistant":
+                        last_agent_msg = text
         elif parser == "claude_jsonl":
             root = os.path.expanduser(meta.get("sessions_dir", "~/.claude/projects"))
             m = glob.glob(os.path.join(root, "*", f"{sid}.jsonl"))
@@ -335,48 +444,114 @@ try:
                 out.append(open(hf).read()[-8000:])
 except Exception as ex:
     out.append(f"_Transcript fallback ({ex}); relying on live Git state below._")
-print("\n\n".join(out) if out else "_No prior transcript parsed; relying on live Git state below._")
+
+task = []
+if last_agent_msg:
+    task.append("### Where the work stopped (last agent message)\n" + last_agent_msg[-1400:])
+else:
+    task.append("_No assistant message recovered from the transcript._")
+if outside_actions:
+    task.append("### Workspace scope\n- " + str(outside_actions) + " recent action(s) in this session touched paths outside `" + top + "` and were omitted.\n- If that was the real work in flight, re-run the bridge from that repository.")
+print("<<<TASK>>>")
+print("\n\n".join(task))
+print("<<<ENDTASK>>>")
+if out:
+    print("\n\n".join(out))
+elif outside_actions:
+    print("_Every recent action in this session ran outside the current worktree, so nothing about this repo was captured. Run the bridge from the repo that actually changed._")
+else:
+    print("_No prior transcript parsed; relying on live Git state below._")
 PY
 )
+  TASK_BODY=$(printf '%s\n' "$CONTEXT_BODY" | sed -n '/^<<<TASK>>>$/,/^<<<ENDTASK>>>$/p' | sed '1d;$d' || true)
+  CONTEXT_BODY=$(printf '%s\n' "$CONTEXT_BODY" | sed '/^<<<TASK>>>$/,/^<<<ENDTASK>>>$/d' || true)
 
   draw_progress 75 "Capturing Git status, commits & working diff..."
-  local GIT_STATUS="" GIT_LOG="" GIT_DIFF=""
+  local GIT_STATUS="" GIT_LOG="" GIT_DIFF="" GIT_SHORT="" GIT_SYNC="" GIT_STASH="" GIT_REFLOG="" UNTRACKED_MD="" UF=""
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     GIT_STATUS=$(git status -sb 2>/dev/null || true)
+    GIT_SHORT=$(git status --short 2>/dev/null | head -40 || true)
     GIT_LOG=$(git log -n 5 --oneline 2>/dev/null || true)
+    GIT_REFLOG=$(git reflog -n 5 2>/dev/null || true)
+    GIT_STASH=$(git stash list 2>/dev/null | head -10 || true)
+    GIT_SYNC=$(git rev-list --left-right --count '@{u}...HEAD' 2>/dev/null | awk '{printf "behind %s / ahead %s", $1, $2}' || true)
     GIT_DIFF=$(git diff HEAD 2>/dev/null | head -c 14000 || true)
+    # Untracked files carry in-flight work that never reaches the diff.
+    while IFS= read -r UF; do
+      [ -n "$UF" ] && [ -f "$UF" ] || continue
+      [ "$(wc -c <"$UF" 2>/dev/null || echo 0)" -gt 65536 ] && continue
+      LC_ALL=C grep -Iq . "$UF" 2>/dev/null || continue
+      UNTRACKED_MD="${UNTRACKED_MD}"$(printf '\n#### %s\n```text\n%s\n```\n' "$UF" "$(head -c 1500 "$UF" 2>/dev/null || true)")
+    done < <(git ls-files --others --exclude-standard 2>/dev/null | head -5 || true)
   fi
   sleep 0.08
 
   draw_progress 100 "Writing .bridge-handoff.md for ${TGT_AGENT}..."
-  cat << MD > "$OUT_MD"
-# Cross-Agent Handoff (${SRC_AGENT} -> ${TGT_AGENT})
-- **Workspace:** \`$PWD\`
-- **Source Session:** \`$SRC_SID\`
-- **Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")
-
-## Mandatory Agent Rules\n- Read this entire file and inspect `git status` + `git diff` BEFORE modifying any file.\n- Do NOT rewrite or revert existing uncommitted changes unless fixing an explicit bug.\n- Keep changes minimal, surgical, and aligned with the project's existing architecture.\n\n## Recent Conversation Context
-$CONTEXT_BODY
-
-## Git Repository State
-\`\`\`text
-$GIT_STATUS
-\`\`\`
-
-### Recent Commits
-\`\`\`text
-$GIT_LOG
-\`\`\`
-
-### Working Diff
-\`\`\`diff
-$GIT_DIFF
-\`\`\`
-MD
+  {
+    printf '# Cross-Agent Handoff (%s -> %s)\n' "$SRC_AGENT" "$TGT_AGENT"
+    printf -- '- **Workspace:** `%s`\n' "$PWD"
+    printf -- '- **Source Session:** `%s`\n' "$SRC_SID"
+    printf -- '- **Generated:** %s\n' "$(date -u +"%Y-%m-%d %H:%M UTC")"
+    printf '\n## Mandatory Agent Rules\n'
+    printf -- '- Read this entire file and inspect `git status` + `git diff` BEFORE modifying any file.\n'
+    printf -- '- Do NOT rewrite or revert existing uncommitted changes unless fixing an explicit bug.\n'
+    printf '%s\n' "- Keep changes minimal, surgical, and aligned with the project's existing architecture."
+    printf '%s\n' "- This handoff is scoped to the worktree above; transcript actions in other directories are not your task."
+    printf '%s\n' "- If the working diff below is empty, confirm with the user whether work was in flight before treating the task as finished."
+    printf '\n## Task State\n'
+    printf '%s\n' "$TASK_BODY"
+    if [ -n "$GIT_SYNC" ]; then
+      printf -- '- **Upstream sync:** %s\n' "$GIT_SYNC"
+    else
+      printf -- '- **Upstream sync:** no upstream tracking branch\n'
+    fi
+    if [ -n "$GIT_SHORT" ]; then
+      printf -- '- **Working tree:** %s changed path(s)\n' "$(printf '%s\n' "$GIT_SHORT" | grep -c . || true)"
+    else
+      printf -- '- **Working tree:** clean\n'
+    fi
+    if [ -n "$GIT_STASH" ]; then
+      printf -- '- **Stashes:** %s\n' "$(printf '%s\n' "$GIT_STASH" | grep -c . || true)"
+    fi
+    printf '\n### Next step\n'
+    printf '%s\n' "- Not recorded by the source session. Infer it from the message above and the working diff, then confirm with the user before large changes."
+    printf '\n## Recent Conversation Context\n'
+    printf '%s\n' "$CONTEXT_BODY"
+    printf '\n## Git Repository State\n'
+    printf '```text\n%s\n```\n' "$GIT_STATUS"
+    printf '\n### Working Tree (git status --short)\n'
+    printf '```text\n%s\n```\n' "${GIT_SHORT:-clean}"
+    printf '\n### Recent Commits\n'
+    printf '```text\n%s\n```\n' "$GIT_LOG"
+    printf '\n### Reflog (last 5)\n'
+    printf '```text\n%s\n```\n' "${GIT_REFLOG:-unavailable}"
+    if [ -n "$GIT_STASH" ]; then
+      printf '\n### Stashes\n'
+      printf '```text\n%s\n```\n' "$GIT_STASH"
+    fi
+    printf '\n### Working Diff\n'
+    printf '```diff\n%s\n```\n' "${GIT_DIFF:-_No uncommitted changes._}"
+    if [ -n "$UNTRACKED_MD" ]; then
+      printf '\n## Untracked Files (contents, first 1500 bytes each)\n'
+      printf '%s\n' "$UNTRACKED_MD"
+    fi
+  } > "$OUT_MD"
+  if [ -z "$GIT_SHORT" ] && [ -z "$GIT_DIFF" ]; then
+    echo -e "\n  ${Y}●${Z} Working tree is clean — this handoff carries no in-flight changes."
+    echo -e "  ${D}If work was half-finished, commit or stash it and re-run the bridge.${Z}"
+  fi
 }
 
 launch_target_agent() {
   local TGT_AGENT="$1" TGT_SID="${2:-}"
+  if [ -n "$TGT_SID" ] && [ "$TGT_SID" != "new" ]; then
+    case "$TGT_SID" in
+      *[!A-Za-z0-9._:-]*)
+        echo -e "\n  ${R}●${Z} Refusing unsafe session id from the agent database."
+        return 1
+        ;;
+    esac
+  fi
   local LAUNCH_CMD
   LAUNCH_CMD=$(python3 - "$AGENTS_CFG" "$TGT_AGENT" "$TGT_SID" << 'PY'
 import json, sys
@@ -392,7 +567,7 @@ PY
   echo -e "\n  ${G}✓${Z} Handoff ready in ${B}.bridge-handoff.md${Z}"
   echo -e "  ${C}›${Z} Tell ${B}${TGT_AGENT}${Z}: ${D}\"Read .bridge-handoff.md and continue\"${Z}"
   echo -e "  ${C}●${Z} Launching: ${B}${LAUNCH_CMD}${Z}\n"
-  eval "exec $LAUNCH_CMD"
+  exec bash -c "$LAUNCH_CMD"
 }
 
 # --- Git Health Audit ---
@@ -659,6 +834,7 @@ run_bridge_wizard() {
   run_with_spinner "Loading ${SRC_AGENT} sessions..." list_agent_sessions "$SRC_AGENT"
   mapfile -t SESSIONS <<< "$SPINNER_OUT"
   echo -e "\n  ${B}step 2/3 · choose ${SRC_AGENT} session${Z}\n  ${D}------------------------------------------${Z}"
+  echo -e "  ${D}* = current workspace · other projects remain available below${Z}"
   local J=1
   for SROW in "${SESSIONS[@]}"; do
     IFS="|" read -r SID STITLE SPROJ STS <<< "$SROW"
@@ -710,7 +886,10 @@ run_bridge_wizard() {
     fi
   fi
 
-  build_handoff_package "$SRC_AGENT" "$PICK_SID" "$TGT_AGENT"
+  if ! build_handoff_package "$SRC_AGENT" "$PICK_SID" "$TGT_AGENT"; then
+    echo -e "\n  ${R}●${Z} Handoff aborted; target agent was not launched.${Z}\n"
+    return 1
+  fi
   launch_target_agent "$TGT_AGENT" "$TGT_SID"
 }
 
@@ -725,6 +904,7 @@ case "${1:-}" in
     echo "  ocb backup [all|<agent>]    Create .tzst backup in Download/TOOL BACKUP"
     echo "  ocb restore                 Restore tools from Download/TOOL BACKUP"
     echo "  ocb health                  Audit Git index, locks & checkpoint tags"
+    echo "  ocb uninstall               Remove engine, config & wrapper (keeps backups)"
     exit 0 ;;
   agents)
     run_with_spinner "Detecting installed agents..." detect_installed_agents
@@ -741,6 +921,7 @@ case "${1:-}" in
   --health|health) run_git_health; exit 0 ;;
   --backup|backup) run_tool_backup "${2:-}"; exit 0 ;;
   --restore|restore) run_tool_restore 1; exit 0 ;;
+  uninstall) uninstall_ocb ;;
 esac
 
 # --- Interactive Control Menu ---
@@ -788,6 +969,7 @@ while true; do
     4) run_tool_backup ;;
     5) run_tool_restore 0 ;;
     6) "$0" agents ;;
-    7|q|Q) exit 0 ;;
+    7) uninstall_ocb ;;
+    8|q|Q) exit 0 ;;
   esac
 done

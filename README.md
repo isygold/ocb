@@ -5,7 +5,7 @@ A user-controlled, cross-agent terminal handoff bridge between **OpenCode**, **F
 `ocb` lets you switch seamlessly between AI coding agents when rate limits hit or when you want a second agent's perspective—preserving your conversation context, recent tool/file actions, working `git diff`, and continuous thread history without manual copy-pasting or accidental keystroke triggers.
 
 ```text
-  █▀▀█ █▀▀ █▀▀▄   ocb v2.0.0
+  █▀▀█ █▀▀ █▀▀▄   ocb v2.1.0
   █  █ █   █▀▀▄   cross-agent control · my-project
   ▀▀▀▀ ▀▀▀ ▀▀▀    ------------------------------------
 ```
@@ -21,6 +21,8 @@ A user-controlled, cross-agent terminal handoff bridge between **OpenCode**, **F
 > [!NOTE]
 > **Full Tool-Action & Diff Handoff (`.bridge-handoff.md`)**
 > Extracts both conversation history and OpenCode's recent `tool`/file actions alongside `git status`, recent commits, and working diffs (automatically ignored via `.git/info/exclude`), while passing direct startup handoff directives to target agents like Freebuff.
+>
+> **v2.1.0:** the package opens with a `## Task State` block (where the previous agent stopped, upstream sync, changed paths, stashes), scopes the action log to the current worktree, captures **untracked file contents**, and warns you when the tree is clean so an empty handoff can't be mistaken for finished work.
 
 > [!IMPORTANT]
 > **Input-Safe Interactive Control & Continuous Thread Resume**
@@ -36,7 +38,7 @@ A user-controlled, cross-agent terminal handoff bridge between **OpenCode**, **F
 ### Termux (Android) & Linux / WSL
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/isygold/ocb/v2.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/isygold/ocb/v2.1/install.sh | bash
 ```
 
 **What the installer does:**
@@ -46,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/isygold/ocb/v2.0/install.sh | bash
 ### Manual Install
 
 ```bash
-git clone -b v2.0 https://github.com/isygold/ocb.git
+git clone -b v2.1 https://github.com/isygold/ocb.git
 cd ocb
 chmod +x install.sh oc-auto
 ./install.sh
