@@ -46,6 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/isygold/ocb/v2.2/install.sh | bash
 **What the installer does:**
 - **On Termux:** Ensures `proot-distro` and `ubuntu` are installed, installs dependencies (`python3`, `sqlite3`, `git`, `zstd`, `tar`, `curl`), places `oc-auto` in `/usr/local/bin/`, and generates a native Termux `ocb` wrapper in `$PREFIX/bin/ocb` that preserves your current working directory and handles clean two-stage uninstalls.
 - **On Linux / WSL:** Installs dependencies and places `ocb` (`/usr/local/bin/oc-auto`) directly in your system `PATH`.
+- **Both platforms:** verify the fetched `oc-auto` matches the release the installer is pinned to (`EXPECTED_VERSION`) and abort on a mismatch, so a stale `REPO_RAW` fails loudly instead of silently installing an old engine.
 
 ### Manual Install
 
