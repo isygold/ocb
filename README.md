@@ -17,6 +17,8 @@ A user-controlled, cross-agent terminal handoff bridge between **OpenCode**, **F
 > [!TIP]
 > **Extensible Multi-Agent Registry (`~/.config/ocb/agents.json`)**
 > Auto-detects installed CLIs (`opencode`, `freebuff`, `claude`, `aider`, `gemini`, `codex`) and lets you pick the exact **Source → Target** tool and thread.
+>
+> Register unsupported CLIs with `ocb register`; they use the `git_diff` fallback (repo state only, no transcript).
 
 > [!NOTE]
 > **Full Tool-Action & Diff Handoff (`.bridge-handoff.md`)**
@@ -31,6 +33,7 @@ A user-controlled, cross-agent terminal handoff bridge between **OpenCode**, **F
 > Resumes existing project sessions directly (`opencode -s <id>` and `freebuff --continue <id>`), drains buffered keystrokes after loading steps, rejects accidental empty `Enter` presses, exits cleanly on `Ctrl+C`, and displays elapsed-time spinners plus UTF-8 progress bars.
 
 - **Workspace Isolation & Git Safety:** Keeps sessions scoped inside `~/projects/<slug>`, creates automatic checkpoint tags (`opencode-latest`), and includes an interactive `.git` lock/index health auditor (`ocb health`).
+- **Handoff Safety:** Redacts common credential patterns, strips ANSI/control characters, labels transcript/tool actions as untrusted, and redacts destructive shell commands from Freebuff tool actions.
 - **Selective `.tzst` Backup, Restore & Uninstall:** Compresses and restores individual or all detected agents (binaries, configs, and session databases) to `Download/TOOL BACKUP` using multi-threaded `zstd`, and includes a two-stage `ocb uninstall` flow that preserves backups and project repos.
 
 ---
@@ -51,10 +54,17 @@ curl -fsSL https://raw.githubusercontent.com/isygold/ocb/v2.2/install.sh | bash
 ### Manual Install
 
 ```bash
-git clone -b v2.2 https://github.com/isygold/ocb.git
+git clone https://github.com/isygold/ocb.git
 cd ocb
 chmod +x install.sh oc-auto
 ./install.sh
+```
+
+Or install a copied engine directly without the repo installer:
+
+```bash
+chmod +x oc-auto
+./oc-auto install
 ```
 
 ---
@@ -86,12 +96,24 @@ ocb
 ocb                         # Launch interactive user-controlled menu
 ocb bridge [src] [tgt]      # Direct cross-agent handoff (optional --new for fresh thread)
 ocb agents                  # List detected tools & registry path
+ocb register                # Register an unsupported CLI (git_diff fallback)
+ocb install                 # Install engine + launcher in ~/.local/bin
 ocb backup [all|<agent>]    # Create a selective .tzst backup in Download/TOOL BACKUP
 ocb restore                 # Restore tools/configs/sessions from a .tzst backup
 ocb health                  # Run Git repository health audit and auto-repair
 ocb uninstall               # Cleanly remove ocb binary & config (preserves backups)
 ocb --version               # Print installed ocb version
 ```
+
+### Custom Agents
+
+If your CLI is not one of the built-ins:
+
+```bash
+ocb register
+```
+
+It prompts for an agent key, display label, binary name, new command, and resume command. The entry is written to `~/.config/ocb/agents.json` with the `git_diff` fallback: repo identity/status/diff only, no transcript or tool actions. A custom parser adapter is required for full context capture.
 
 ---
 
