@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/isygold/ocb/v2.2"
+REPO_RAW="https://raw.githubusercontent.com/isygold/ocb/v2.3"
 # Bump together with REPO_RAW and VERSION in oc-auto on every release.
-EXPECTED_VERSION="2.2.0"
+EXPECTED_VERSION="2.3.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The installer is pinned to a release branch, so a forgotten bump ships an old
