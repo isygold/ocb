@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/isygold/ocb/v2.3/install.sh | bash
 ```
 
 **What the installer does:**
-- **On Termux:** Ensures `proot-distro` and `ubuntu` are installed, installs dependencies (`python3`, `sqlite3`, `git`, `zstd`, `tar`, `curl`), places `oc-auto` in `/usr/local/bin/`, and generates a native Termux `ocb` wrapper in `$PREFIX/bin/ocb` that preserves your current working directory and handles clean two-stage uninstalls.
+- **On Termux:** Reports the detected host, reuses an existing `ubuntu` container (detected from its rootfs, not from `proot-distro list` wording), writes `oc-auto` into that container's `/usr/local/bin/` even while it is running, installs dependencies (`python3`, `sqlite3`, `git`, `zstd`, `tar`, `curl`) when the container is free, and generates a native Termux `ocb` wrapper in `$PREFIX/bin/ocb` that preserves your current working directory and handles clean two-stage uninstalls.
 - **On Linux / WSL / macOS:** Uses whichever package manager the host has (`apt-get`, `dnf`, `yum`, `pacman`, `apk`, or `brew`) and installs `ocb` into `/usr/local/bin`, falling back to `~/.local/bin` when that path is not writable.
 - **Inside the Ubuntu proot container:** Detects the proot session from `$PREFIX`/`PROOT_L2S_DIR` and installs natively there instead of trying to bootstrap another Ubuntu.
 - **All platforms:** verify the fetched `oc-auto` matches the release the installer is pinned to (`EXPECTED_VERSION`) and abort on a mismatch, so a stale `REPO_RAW` fails loudly instead of silently installing an old engine.

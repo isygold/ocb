@@ -36,15 +36,42 @@ in_termux_host() {
   [ -z "${PROOT_L2S_DIR:-}${PROOT_TMP_DIR:-}" ]
 }
 
+os_name() {
+  [ -r /etc/os-release ] || return 0
+  sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release | head -1
+}
+
+# Report the host instead of silently picking an install strategy.
+detect_host() {
+  if in_termux_host; then
+    echo "Termux (Android)"
+  elif [ -n "${PROOT_L2S_DIR:-}${PROOT_TMP_DIR:-}" ]; then
+    local name; name=$(os_name)
+    echo "proot container${name:+ ($name)}"
+  elif [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    echo "macOS"
+  elif grep -qi microsoft /proc/version 2>/dev/null; then
+    echo "WSL"
+  else
+    local name; name=$(os_name)
+    echo "Linux${name:+ ($name)}"
+  fi
+}
+
+echo "Host detected: $(detect_host)"
+
 if in_termux_host; then
   command -v proot-distro >/dev/null 2>&1 || pkg install -y proot-distro
-  if ! distros=$(proot-distro list 2>/dev/null); then
-    echo "ocb install aborted: proot-distro is not usable from this shell." >&2
-    echo "Run the installer from Termux, not from inside the Ubuntu container." >&2
-    exit 1
-  fi
-  if ! grep -q "ubuntu.*installed" <<<"$distros"; then
-    echo "Installing Ubuntu proot-distro..."
+  CONTAINERS_DIR="${PROOT_DISTRO_CONTAINERS_DIR:-$PREFIX/var/lib/proot-distro/containers}"
+  UBUNTU_ROOTFS="$CONTAINERS_DIR/ubuntu/rootfs"
+
+  # Trust the container's rootfs, not the wording of `proot-distro list`:
+  # current releases print "Installed containers:" + "* ubuntu", and older
+  # ones a different layout again.
+  if [ -d "$UBUNTU_ROOTFS" ]; then
+    echo "Ubuntu container: already installed"
+  else
+    echo "Ubuntu container: not installed; installing..."
     proot-distro install ubuntu
   fi
 
@@ -55,12 +82,20 @@ if in_termux_host; then
   fi
   verify_engine "$PREFIX/tmp/oc-auto.install" || { rm -f "$PREFIX/tmp/oc-auto.install"; exit 1; }
 
-  proot-distro login ubuntu -- bash -c "
-    apt-get update -qq && apt-get install -y -qq python3 sqlite3 git zstd tar curl >/dev/null
-    mv /data/data/com.termux/files/usr/tmp/oc-auto.install /usr/local/bin/oc-auto
-    chmod +x /usr/local/bin/oc-auto
-    ln -sf /usr/local/bin/oc-auto /usr/local/bin/ocb
-  "
+  # Write the verified engine into the container's rootfs. Unlike
+  # `proot-distro login`, this works while the container is already running
+  # (a live session holds the container lock).
+  mkdir -p "$UBUNTU_ROOTFS/usr/local/bin"
+  install -m 755 "$PREFIX/tmp/oc-auto.install" "$UBUNTU_ROOTFS/usr/local/bin/oc-auto"
+  ln -sf /usr/local/bin/oc-auto "$UBUNTU_ROOTFS/usr/local/bin/ocb"
+  rm -f "$PREFIX/tmp/oc-auto.install"
+
+  # Dependencies live inside Ubuntu, so apt still needs a login. Skip quietly
+  # when the container is busy; a running container is already provisioned.
+  if ! proot-distro login ubuntu -- bash -c "apt-get update -qq && apt-get install -y -qq python3 sqlite3 git zstd tar curl >/dev/null" >/dev/null 2>&1; then
+    echo "Ubuntu container is in use; skipped dependency check."
+    echo "If a tool is missing, run: proot-distro login ubuntu -- apt-get install python3 sqlite3 git zstd tar curl"
+  fi
 
   cat << 'WRAP' > "$PREFIX/bin/ocb"
 #!/usr/bin/env bash
@@ -113,6 +148,7 @@ else
     TARGET_DIR="$HOME/.local/bin"
   fi
   [ -d "$TARGET_DIR" ] || $SUDO mkdir -p "$TARGET_DIR"
+  echo "Install target: $TARGET_DIR"
 
   # Stage first so a mismatched engine never reaches the install path.
   TMP_ENGINE=$(mktemp)
