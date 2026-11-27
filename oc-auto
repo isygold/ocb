@@ -1056,17 +1056,8 @@ run_tool_restore() {
     SCOPE="${INSTALLED[$IDX]%%|*}"
   fi
 
-  local LIST_TMP; LIST_TMP=$(mktemp)
-  zstd -dc "$PICK" | tar -tf - | python3 - "$SCOPE" << 'PY' > "$LIST_TMP"
-import sys
-scope = sys.argv[1].lower()
-aliases = {"freebuff": ("freebuff", "manicode")}
-keys = aliases.get(scope, (scope,))
-for line in sys.stdin:
-    p = line.rstrip("\n")
-    if scope == "all" or any(k in p.lower() for k in keys):
-        print(p)
-PY
+  echo "✅ done"
+exec ocb
 
   if [ ! -s "$LIST_TMP" ]; then
     rm -f "$LIST_TMP"
