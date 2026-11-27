@@ -4,7 +4,12 @@ set -euo pipefail
 REPO_RAW="https://raw.githubusercontent.com/isygold/ocb/v2.3"
 # Bump together with REPO_RAW and VERSION in oc-auto on every release.
 EXPECTED_VERSION="2.3.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Piped installs (curl ... | bash) have no script path, so a sibling oc-auto can
+# only be used when this file actually exists on disk.
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
 # The installer is pinned to a release branch, so a forgotten bump ships an old
 # engine silently. Fail loudly instead of installing the wrong version.
@@ -43,7 +48,7 @@ if in_termux_host; then
     proot-distro install ubuntu
   fi
 
-  if [ -f "$SCRIPT_DIR/oc-auto" ]; then
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/oc-auto" ]; then
     cp "$SCRIPT_DIR/oc-auto" "$PREFIX/tmp/oc-auto.install"
   else
     curl -fsSL "$REPO_RAW/oc-auto" -o "$PREFIX/tmp/oc-auto.install"
@@ -112,7 +117,7 @@ else
   # Stage first so a mismatched engine never reaches the install path.
   TMP_ENGINE=$(mktemp)
   trap 'rm -f "$TMP_ENGINE"' EXIT
-  if [ -f "$SCRIPT_DIR/oc-auto" ]; then
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/oc-auto" ]; then
     cp "$SCRIPT_DIR/oc-auto" "$TMP_ENGINE"
   else
     curl -fsSL "$REPO_RAW/oc-auto" -o "$TMP_ENGINE"
