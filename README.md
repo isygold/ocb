@@ -22,7 +22,7 @@ A user-controlled, cross-agent terminal handoff bridge between **OpenCode**, **F
 
 > [!NOTE]
 > **Full Tool-Action & Diff Handoff (`.bridge-handoff.md`)**
-> Extracts both conversation history and OpenCode's recent `tool`/file actions alongside `git status`, recent commits, and working diffs (automatically ignored via `.git/info/exclude`), while passing direct startup handoff directives to target agents like Freebuff.
+> Extracts both conversation history and recent `tool`/file actions alongside `git status`, recent commits, and working diffs (automatically ignored via `.git/info/exclude`), while passing direct startup handoff directives to target agents like Freebuff.
 >
 > **v2.1.0:** the package opens with a `## Task State` block (where the previous agent stopped, upstream sync, changed paths, stashes), scopes the action log to the current worktree, captures **untracked file contents**, and warns you when the tree is clean so an empty handoff can't be mistaken for finished work.
 >
@@ -131,7 +131,7 @@ It prompts for an agent key, display label, binary name, new command, and resume
 ## AI & Safety Disclaimer
 
 > [!WARNING]
-> This project was developed with AI assistance. While `ocb` has been tested on Termux (Ubuntu `proot-distro`) and Linux environments, operations such as SQLite session pruning, Git index repairs, `.tzst` archive restores, and uninstallation modify local files and configurations. Always verify your backups before restoring over active setups. `ocb` is an independent community utility and is not officially affiliated with OpenCode or Freebuff.
+> This project was developed with AI assistance. While `ocb` has been tested on Termux (Ubuntu `proot-distro`) and Linux environments, operations such as SQLite session pruning, Git index repairs, `.tzst` archive restores, and uninstallation modify local files and configurations. Always verify your backups before restoring over active setups. `ocb` is an independent community utility and is not officially affiliated with OpenCode or Freebuff or other AI agent tools.
 
 ---
 
