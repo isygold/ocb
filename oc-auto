@@ -219,7 +219,7 @@ PY
 register_agent() {
   ensure_agents_config
   echo -e "\n  ${B}register custom agent${Z}\n  ${D}------------------------------------------${Z}"
-  echo -e "  ${D}Registers a CLI with the git_diff fallback: repo state only, no transcript.${Z}\n"
+  echo -e "  ${D}Registers a agent tool with the git_diff fallback: repo state only, no transcript.${Z}\n"
   local KEY LABEL BIN NEW_CMD RESUME_CMD
   printf "  ${C}›${Z} Agent key (letters/digits/_/-): "; IFS= read -r KEY || return 1
   KEY=$(printf '%s' "$KEY" | tr '[:upper:]' '[:lower:]')
@@ -277,7 +277,7 @@ list_detected_agents() {
     [ -z "$K" ] && continue
     echo -e "  ${G}●${Z} ${B}$L${Z} ($K) ${D}→ $P [$PARSER]${Z}"
   done <<< "$SPINNER_OUT"
-  echo -e "  ${D}Add an unsupported CLI from here, or later: ocb register${Z}"
+  echo -e "  ${D}Add an unsupported agent tool from here, or later: ocb register${Z}"
   echo ""
 }
 
