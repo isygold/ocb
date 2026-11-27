@@ -89,9 +89,7 @@ run_with_spinner() {
   done
   set +e; wait "$PID"; local RC=$?; set -e
   printf "\r\033[K\033[?25h" 2>/dev/null || true
-  if [ -t 0 ]; then
-    while IFS= read -r -t 0.01 -n 1 _ </dev/tty 2>/dev/null; do :; done
-  fi
+  # Do not drain pending keystrokes here: type-ahead belongs to the next prompt.
   SPINNER_OUT=$(cat "$TMP_OUT")
   rm -f "$TMP_OUT"
   if [ "$RC" -ne 0 ] && [ -n "$SPINNER_OUT" ]; then
@@ -109,11 +107,21 @@ back_to_menu_loader() {
   printf "\r\033[K\n"
 }
 
+ocb_has_tty() { { : </dev/tty; } 2>/dev/null; }
+
 read_choice() {
   local PROMPT="$1" MIN="$2" MAX="$3" VAL=""
   while true; do
-    printf "%b" "$PROMPT" >/dev/tty
-    IFS= read -r VAL </dev/tty || exit 130
+    if ! printf "%b" "$PROMPT" >/dev/tty 2>/dev/null; then
+      printf "\n  ${Y}●${Z} This menu needs a terminal; /dev/tty is unavailable.\n" >&2
+      printf "  ${D}Use the direct commands instead: ocb agents · ocb register · ocb bridge <src> <tgt>${Z}\n" >&2
+      exit 1
+    fi
+    if ! IFS= read -r VAL </dev/tty; then
+      printf "\n  ${Y}●${Z} No input from this terminal; leaving the menu.\n" >&2
+      printf "  ${D}List CLIs with: ocb agents   ·   add one with: ocb register${Z}\n" >&2
+      exit 130
+    fi
     VAL="${VAL//[[:space:]]/}"
     if [ -z "$VAL" ]; then
       printf "  \033[33m●\033[0m Empty input — enter %s-%s (or q to cancel).\n" "$MIN" "$MAX" >/dev/tty
@@ -130,6 +138,11 @@ read_choice() {
 # --- Default Multi-Agent Registry ---
 ensure_agents_config() {
   mkdir -p "$CFG_DIR"
+  # Self-heal a corrupted registry instead of failing every menu redraw.
+  if [ -f "$AGENTS_CFG" ] && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$AGENTS_CFG" 2>/dev/null; then
+    mv -f "$AGENTS_CFG" "$AGENTS_CFG.broken" 2>/dev/null || rm -f "$AGENTS_CFG"
+    CFG_RECOVERED=1
+  fi
   if [ ! -f "$AGENTS_CFG" ]; then
     cat << 'JSON' > "$AGENTS_CFG"
 {
@@ -252,6 +265,35 @@ PY
   fi
   echo -e "  ${D}Parser: git_diff — repo state only; transcript/tool actions need a custom adapter.${Z}"
   echo -e "  ${D}Try: ocb bridge $KEY opencode${Z}\n"
+}
+
+list_detected_agents() {
+  run_with_spinner "Detecting installed agents..." detect_installed_agents
+  if [ "${CFG_RECOVERED:-0}" = "1" ]; then
+    echo -e "  ${Y}●${Z} agents.json was unreadable; restored defaults (old copy: ${B}$AGENTS_CFG.broken${Z})"
+  fi
+  echo -e "\n  ${B}detected agents${Z} ${D}· $AGENTS_CFG${Z}\n  ${D}------------------------------------------${Z}"
+  while IFS="|" read -r K L P PARSER; do
+    [ -z "$K" ] && continue
+    echo -e "  ${G}●${Z} ${B}$L${Z} ($K) ${D}→ $P [$PARSER]${Z}"
+  done <<< "$SPINNER_OUT"
+  echo -e "  ${D}Add an unsupported CLI from here, or later: ocb register${Z}"
+  echo ""
+}
+
+# Menu entry: list detected CLIs, then offer to register one without leaving ocb.
+agents_registry() {
+  list_detected_agents
+  local ANS=""
+  printf "  ${C}›${Z} Register an unsupported CLI now? [y/N]: "
+  if ! IFS= read -r ANS </dev/tty 2>/dev/null && ! IFS= read -r ANS; then
+    echo -e "  ${D}No terminal input; nothing registered.${Z}\n"
+    return 0
+  fi
+  case "$ANS" in
+    y|Y) register_agent || echo -e "  ${D}Nothing registered.${Z}\n" ;;
+    *) echo -e "  ${D}Nothing registered.${Z}\n" ;;
+  esac
 }
 
 # --- Session Discovery Across Adapters ---
@@ -938,7 +980,9 @@ PY
   draw_progress 10 "Calculating archive size (${#PATHS[@]} target(s))..."
   local TOTAL_BYTES=0
   for P in "${PATHS[@]}"; do
-    local SZ; SZ=$(du -sb "/$P" 2>/dev/null | cut -f1 || echo 0)
+    # du -sk works on GNU, BusyBox and BSD (macOS); -b does not.
+    local SZ; SZ=$(du -sk "/$P" 2>/dev/null | cut -f1)
+    SZ=$(( ${SZ:-0} * 1024 ))
     TOTAL_BYTES=$(( TOTAL_BYTES + SZ ))
   done
   [ "$TOTAL_BYTES" -le 0 ] && TOTAL_BYTES=1048576
@@ -1119,6 +1163,9 @@ uninstall_ocb() {
 
   rm -rf "$HOME/.config/ocb"
   rm -f /usr/local/bin/oc-auto "$HOME/.local/bin/oc-auto" "$HOME/.local/bin/ocb"
+  if [ -n "${PREFIX:-}" ] && [[ "$PREFIX" == *"com.termux"* ]]; then
+    rm -f "$PREFIX/bin/ocb"
+  fi
   echo -e "  ${G}✓${Z} Removed engine, portable launcher, and config."
   exit 99
 }
@@ -1126,7 +1173,8 @@ uninstall_ocb() {
 run_bridge_wizard() {
   local SRC_AGENT="${1:-}" TGT_AGENT="${2:-}" FORCE_NEW="${3:-0}"
   run_with_spinner "Scanning installed CLI agents..." detect_installed_agents
-  mapfile -t AGENTS <<< "$SPINNER_OUT"
+  # A here-string turns empty output into one empty element; drop blank rows.
+  mapfile -t AGENTS < <(printf '%s\n' "$SPINNER_OUT" | sed '/^$/d')
 
   if [ ${#AGENTS[@]} -eq 0 ]; then
     echo -e "  ${R}●${Z} No supported agents found on PATH. Edit ${B}$AGENTS_CFG${Z} to register tools.\n"
@@ -1150,7 +1198,11 @@ run_bridge_wizard() {
 
   # 2. Select Source Session
   run_with_spinner "Loading ${SRC_AGENT} sessions..." list_agent_sessions "$SRC_AGENT"
-  mapfile -t SESSIONS <<< "$SPINNER_OUT"
+  mapfile -t SESSIONS < <(printf '%s\n' "$SPINNER_OUT" | sed '/^$/d')
+  if [ ${#SESSIONS[@]} -eq 0 ]; then
+    echo -e "  ${R}●${Z} No sessions readable for ${B}${SRC_AGENT}${Z}; browser-only handoff from Git state."
+    SESSIONS=("git-diff|Current Git Diff & Recent Commits|$(basename "$PWD")|live")
+  fi
   echo -e "\n  ${B}step 2/3 · choose ${SRC_AGENT} session${Z}\n  ${D}------------------------------------------${Z}"
   echo -e "  ${D}* = current workspace · other projects remain available below${Z}"
   local J=1
@@ -1226,15 +1278,7 @@ case "${1:-}" in
     echo "  ocb health                  Audit Git index, locks & checkpoint tags"
     echo "  ocb uninstall               Remove engine, config & wrapper (keeps backups)"
     exit 0 ;;
-  agents)
-    run_with_spinner "Detecting installed agents..." detect_installed_agents
-    echo -e "\n  ${B}detected agents${Z} ${D}· $AGENTS_CFG${Z}\n  ${D}------------------------------------------${Z}"
-    while IFS="|" read -r K L P PARSER; do
-      [ -z "$K" ] && continue
-      echo -e "  ${G}●${Z} ${B}$L${Z} ($K) ${D}→ $P [$PARSER]${Z}"
-    done <<< "$SPINNER_OUT"
-    echo -e "  ${D}Add an unsupported CLI: ocb register${Z}"
-    echo ""; exit 0 ;;
+  agents) list_detected_agents; exit 0 ;;
   register) register_agent; exit 0 ;;
   install) install_ocb; exit 0 ;;
   bridge)
@@ -1248,6 +1292,11 @@ case "${1:-}" in
 esac
 
 # --- Interactive Control Menu ---
+if ! ocb_has_tty; then
+  echo -e "\n  ${Y}●${Z} The ocb menu needs an interactive terminal (/dev/tty is unavailable here)." >&2
+  echo -e "  ${D}Run one of: ocb agents · ocb register · ocb bridge <src> <tgt> · ocb --help${Z}\n" >&2
+  exit 1
+fi
 while true; do
   run_with_spinner "Scanning workspace & agents..." detect_installed_agents
   mapfile -t DET <<< "$SPINNER_OUT"
@@ -1291,7 +1340,7 @@ while true; do
     3) run_git_health ;;
     4) run_tool_backup ;;
     5) run_tool_restore 0 ;;
-    6) "$0" agents ;;
+    6) agents_registry ;;
     7) uninstall_ocb ;;
     8|q|Q) exit 0 ;;
   esac
