@@ -49,10 +49,11 @@ curl -fsSL https://raw.githubusercontent.com/isygold/ocb/v2.3/install.sh | bash
 ```
 
 **What the installer does:**
-- **On Termux:** Reports the detected host, reuses an existing `ubuntu` container (detected from its rootfs, not from `proot-distro list` wording), writes `oc-auto` into that container's `/usr/local/bin/` even while it is running, installs dependencies (`python3`, `sqlite3`, `git`, `zstd`, `tar`, `curl`) when the container is free, and generates a native Termux `ocb` wrapper in `$PREFIX/bin/ocb` that preserves your current working directory and handles clean two-stage uninstalls.
-- **On Linux / WSL / macOS:** Uses whichever package manager the host has (`apt-get`, `dnf`, `yum`, `pacman`, `apk`, or `brew`) and installs `ocb` into `/usr/local/bin`, falling back to `~/.local/bin` when that path is not writable.
-- **Inside the Ubuntu proot container:** Detects the proot session from `$PREFIX`/`PROOT_L2S_DIR` and installs natively there instead of trying to bootstrap another Ubuntu.
-- **All platforms:** verify the fetched `oc-auto` matches the release the installer is pinned to (`EXPECTED_VERSION`) and abort on a mismatch, so a stale `REPO_RAW` fails loudly instead of silently installing an old engine.
+- **On Termux:** The installer checks `$PREFIX` for `com.termux` and absences of `PROOT_L2S_DIR`/`PROOT_TMP_DIR`; if found, it reports **host: Termux** and skips Ubuntu bootstrap entirely, writing `oc-auto` into the existing container's `/usr/local/bin` even while it runs and generating a native `$PREFIX/bin/ocb` wrapper.
+- **On proot container (Linux/WSL):** If `$PREFIX` lacks `com.termux` but `PROOT_L2S_DIR` or `PROOT_TMP_DIR` is set, the installer detects **host: proot container (Ubuntu 26.04.1 LTS)** and reports which distro. It then checks the container's rootfs (`$PREFIX/var/lib/proot-distro/containers/ubuntu/rootfs`); if the rootfs directory exists, it reports **Ubuntu container: already installed** and writes `oc-auto` directly into that rootfs's `/usr/local/bin` — no `proot-distro install ubuntu` is attempted, even when the container is busy. If the rootfs is absent, it reports **Ubuntu container: not installed; installing...** and runs `proot-distro install ubuntu`.
+- **On Linux / WSL / macOS:** The installer picks the host's package manager (`apt-get`, `dnf`, `yum`, `pacman`, `apk`, or `brew`) and installs `ocb` into `/usr/local/bin`, falling back to `~/.local/bin` when that path is not writable. Host type is reported so you know what you're running on.
+- **All platforms:** The fetched `oc-auto` version is verified against the release the installer is pinned to (`EXPECTED_VERSION`); a mismatch aborts the install so a stale `REPO_RAW` fails loudly instead of silently installing an old engine.
+- **Busy-container safety:** When the Ubuntu rootfs is present but the container is running (e.g., `proot-distro login ubuntu` holds the lock), the installer writes the engine directly into the rootfs via `install -m 755` rather than trying `proot-distro login`, so a live session never blocks the install.
 
 ### Manual Install
 
